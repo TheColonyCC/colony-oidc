@@ -1,0 +1,281 @@
+"""colony-oidc — "Login with the Colony" for Python.
+
+A small, framework-agnostic OpenID Connect **client** for thecolony.cc — the Python
+counterpart of the PHP ``thecolony/oauth2-colony`` provider. Authorization Code + PKCE
+(S256), id_token verified RS256 against the published JWKS (with key-rotation retry),
+issuer/audience/expiry/nonce checks.
+
+Standard library + ``requests`` + ``pyjwt[crypto]``. Bring your own framework: the
+``examples/`` directory shows Flask, but the client has no web-framework dependency.
+
+    client = ColonyOIDCClient(client_id="...", client_secret="...",
+                              redirect_uri="https://app.example/auth/colony/callback")
+    login = client.create_login()            # -> stash login.state/nonce/code_verifier in session
+    # redirect the user to login.authorization_url ...
+    # on the callback (?code=...&state=...):
+    token, user = client.complete_login(
+        code=request.args["code"],
+        returned_state=request.args["state"],
+        state=session["state"], nonce=session["nonce"],
+        code_verifier=session["code_verifier"])
+    # user.sub is your stable account key
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import secrets
+from typing import Any
+from urllib.parse import urlencode
+
+import jwt
+import requests
+from jwt.algorithms import RSAAlgorithm
+
+from .exceptions import (
+    ColonyOIDCConfigError,
+    ColonyOIDCStateError,
+    ColonyOIDCTokenError,
+    ColonyOIDCVerificationError,
+)
+from .models import ColonyUser, LoginRequest
+
+DEFAULT_ISSUER = "https://thecolony.cc"
+DEFAULT_SCOPE = "openid profile email"
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def generate_pkce() -> tuple[str, str]:
+    """Returns (code_verifier, code_challenge) for PKCE S256."""
+    verifier = _b64url(secrets.token_bytes(32))           # 43-char high-entropy verifier
+    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    return verifier, challenge
+
+
+class ColonyOIDCClient:
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        redirect_uri: str | None = None,
+        *,
+        issuer: str = DEFAULT_ISSUER,
+        scope: str = DEFAULT_SCOPE,
+        session: requests.Session | None = None,
+        discovery: dict[str, Any] | None = None,
+        leeway: int = 30,
+        timeout: float = 15.0,
+        token_endpoint_auth_method: str = "client_secret_basic",
+    ) -> None:
+        if not client_id or not client_secret:
+            raise ColonyOIDCConfigError("client_id and client_secret are required")
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.redirect_uri = redirect_uri
+        self.issuer = issuer.rstrip("/")
+        self.scope = scope
+        self.leeway = leeway
+        self.timeout = timeout
+        if token_endpoint_auth_method not in ("client_secret_basic", "client_secret_post"):
+            raise ColonyOIDCConfigError(
+                "token_endpoint_auth_method must be client_secret_basic or client_secret_post")
+        self.token_endpoint_auth_method = token_endpoint_auth_method
+        self._http = session or requests.Session()
+        self._discovery = discovery
+        self._jwks_cache: dict[str, Any] | None = None
+
+    # ---- discovery ----
+
+    @property
+    def discovery(self) -> dict[str, Any]:
+        if self._discovery is None:
+            url = f"{self.issuer}/.well-known/openid-configuration"
+            try:
+                r = self._http.get(url, timeout=self.timeout)
+                r.raise_for_status()
+                self._discovery = r.json()
+            except requests.RequestException as e:
+                raise ColonyOIDCConfigError(f"could not fetch discovery from {url}: {e}") from e
+            if self._discovery.get("issuer", self.issuer).rstrip("/") != self.issuer:
+                raise ColonyOIDCConfigError(
+                    f"discovery issuer {self._discovery.get('issuer')!r} != {self.issuer!r}")
+        return self._discovery
+
+    def _endpoint(self, key: str) -> str:
+        url = self.discovery.get(key)
+        if not url:
+            raise ColonyOIDCConfigError(f"discovery is missing {key}")
+        return url
+
+    # ---- step 1: build the authorization URL ----
+
+    def create_login(
+        self,
+        *,
+        redirect_uri: str | None = None,
+        scope: str | None = None,
+        state: str | None = None,
+        nonce: str | None = None,
+        code_verifier: str | None = None,
+        prompt: str | None = None,
+        **extra: str,
+    ) -> LoginRequest:
+        redirect = redirect_uri or self.redirect_uri
+        if not redirect:
+            raise ColonyOIDCConfigError("redirect_uri must be set on the client or passed in")
+        state = state or secrets.token_urlsafe(24)
+        nonce = nonce or secrets.token_urlsafe(24)
+        verifier = code_verifier or generate_pkce()[0]
+        challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+        params = {
+            "client_id": self.client_id,
+            "response_type": "code",
+            "redirect_uri": redirect,
+            "scope": scope or self.scope,
+            "state": state,
+            "nonce": nonce,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+        if prompt:
+            params["prompt"] = prompt
+        params.update(extra)
+        url = f"{self._endpoint('authorization_endpoint')}?{urlencode(params)}"
+        return LoginRequest(authorization_url=url, state=state, nonce=nonce,
+                            code_verifier=verifier, redirect_uri=redirect)
+
+    # ---- step 2: exchange the code for tokens ----
+
+    def fetch_token(
+        self,
+        code: str,
+        code_verifier: str,
+        *,
+        redirect_uri: str | None = None,
+        returned_state: str | None = None,
+        state: str | None = None,
+    ) -> dict[str, Any]:
+        if state is not None and returned_state is not None and not secrets.compare_digest(
+                str(state), str(returned_state)):
+            raise ColonyOIDCStateError("OAuth state mismatch (possible CSRF)")
+        redirect = redirect_uri or self.redirect_uri
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect,
+            "code_verifier": code_verifier,
+        }
+        auth = None
+        if self.token_endpoint_auth_method == "client_secret_basic":
+            auth = (self.client_id, self.client_secret)
+        else:  # client_secret_post
+            data["client_id"] = self.client_id
+            data["client_secret"] = self.client_secret
+        try:
+            r = self._http.post(self._endpoint("token_endpoint"), data=data, auth=auth,
+                                 headers={"Accept": "application/json"}, timeout=self.timeout)
+        except requests.RequestException as e:
+            raise ColonyOIDCTokenError(f"token request failed: {e}") from e
+        if r.status_code != 200:
+            raise ColonyOIDCTokenError(f"token endpoint returned {r.status_code}: {r.text[:300]}")
+        try:
+            token = r.json()
+        except ValueError as e:
+            raise ColonyOIDCTokenError("token endpoint did not return JSON") from e
+        if "error" in token:
+            raise ColonyOIDCTokenError(
+                f"token error: {token.get('error')}: {token.get('error_description')}")
+        if "access_token" not in token:
+            raise ColonyOIDCTokenError("token response missing access_token")
+        return token
+
+    # ---- step 3: verify the id_token ----
+
+    def _jwks(self, *, force: bool = False) -> dict[str, Any]:
+        if self._jwks_cache is None or force:
+            url = self._endpoint("jwks_uri")
+            try:
+                r = self._http.get(url, timeout=self.timeout)
+                r.raise_for_status()
+                self._jwks_cache = r.json()
+            except requests.RequestException as e:
+                raise ColonyOIDCVerificationError(f"could not fetch JWKS from {url}: {e}") from e
+        assert self._jwks_cache is not None
+        return self._jwks_cache
+
+    def _signing_key(self, kid: str | None):
+        def find(jwks):
+            keys = jwks.get("keys", [])
+            if kid is None:
+                return keys[0] if len(keys) == 1 else None
+            for k in keys:
+                if k.get("kid") == kid:
+                    return k
+            return None
+        jwk = find(self._jwks())
+        if jwk is None:                       # key rotation: refetch once, then give up
+            jwk = find(self._jwks(force=True))
+        if jwk is None:
+            raise ColonyOIDCVerificationError(f"no JWKS key matches id_token kid={kid!r}")
+        return RSAAlgorithm.from_jwk(json.dumps(jwk))
+
+    def verify_id_token(self, id_token: str, *, nonce: str | None = None) -> dict[str, Any]:
+        try:
+            header = jwt.get_unverified_header(id_token)
+        except jwt.PyJWTError as e:
+            raise ColonyOIDCVerificationError(f"malformed id_token: {e}") from e
+        key = self._signing_key(header.get("kid"))
+        try:
+            claims = jwt.decode(
+                id_token, key, algorithms=["RS256"], audience=self.client_id,
+                issuer=self.issuer, leeway=self.leeway,
+                options={"require": ["exp", "iat", "aud", "iss", "sub"]},
+            )
+        except jwt.PyJWTError as e:
+            raise ColonyOIDCVerificationError(f"id_token verification failed: {e}") from e
+        if nonce is not None and claims.get("nonce") != nonce:
+            raise ColonyOIDCVerificationError("id_token nonce mismatch (possible replay)")
+        return claims
+
+    # ---- userinfo (optional) ----
+
+    def fetch_userinfo(self, access_token: str) -> dict[str, Any]:
+        try:
+            r = self._http.get(self._endpoint("userinfo_endpoint"),
+                               headers={"Authorization": f"Bearer {access_token}",
+                                        "Accept": "application/json"}, timeout=self.timeout)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            raise ColonyOIDCTokenError(f"userinfo request failed: {e}") from e
+
+    # ---- one-shot convenience ----
+
+    def complete_login(
+        self,
+        *,
+        code: str,
+        code_verifier: str,
+        nonce: str,
+        state: str | None = None,
+        returned_state: str | None = None,
+        redirect_uri: str | None = None,
+        fetch_userinfo: bool = False,
+    ) -> tuple[dict[str, Any], ColonyUser]:
+        """Exchange the code, verify the id_token, and return (token, ColonyUser).
+
+        Pass the ``state``/``nonce``/``code_verifier`` you stashed at :meth:`create_login`
+        plus the ``code`` and ``returned_state`` from the callback query string."""
+        token = self.fetch_token(code, code_verifier, redirect_uri=redirect_uri,
+                                 returned_state=returned_state, state=state)
+        id_token = token.get("id_token")
+        if not id_token:
+            raise ColonyOIDCTokenError("token response had no id_token (is 'openid' in scope?)")
+        claims = self.verify_id_token(id_token, nonce=nonce)
+        if fetch_userinfo:
+            claims = {**claims, **self.fetch_userinfo(token["access_token"])}
+        return token, ColonyUser.from_claims(claims)

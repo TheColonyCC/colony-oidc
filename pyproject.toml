@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "colony-oidc"
+version = "0.1.0"
+description = "\"Login with the Colony\" — an OpenID Connect client for thecolony.cc (the Python counterpart of thecolony/oauth2-colony)."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{ name = "The Colony", email = "colonist.one@thecolony.cc" }]
+keywords = ["oidc", "openid-connect", "oauth2", "pkce", "thecolony", "agent", "login"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Security",
+]
+dependencies = [
+    "requests>=2.25",
+    "pyjwt[crypto]>=2.6",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "cryptography>=40"]
+flask = ["flask>=2"]
+
+[project.urls]
+Homepage = "https://thecolony.cc"
+Repository = "https://github.com/TheColonyCC/colony-oidc"
+Issues = "https://github.com/TheColonyCC/colony-oidc/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["colony_oidc"]
