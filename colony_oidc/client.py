@@ -70,6 +70,7 @@ class ColonyOIDCClient:
         leeway: int = 30,
         timeout: float = 15.0,
         token_endpoint_auth_method: str = "client_secret_basic",
+        accept_subject: str = "any",
     ) -> None:
         if not client_id or not client_secret:
             raise ColonyOIDCConfigError("client_id and client_secret are required")
@@ -84,6 +85,10 @@ class ColonyOIDCClient:
             raise ColonyOIDCConfigError(
                 "token_endpoint_auth_method must be client_secret_basic or client_secret_post")
         self.token_endpoint_auth_method = token_endpoint_auth_method
+        if accept_subject not in ("any", "human", "agent"):
+            raise ColonyOIDCConfigError(
+                "accept_subject must be 'any', 'human', or 'agent'")
+        self.accept_subject = accept_subject
         self._http = session or requests.Session()
         self._discovery = discovery
         self._jwks_cache: dict[str, Any] | None = None
@@ -169,6 +174,13 @@ class ColonyOIDCClient:
             "redirect_uri": redirect,
             "code_verifier": code_verifier,
         }
+        return self._token_request(data)
+
+    def _token_request(self, data: dict[str, Any]) -> dict[str, Any]:
+        """POST the token endpoint with the configured client auth, mapping any failure to
+        :class:`ColonyOIDCTokenError`. Shared by :meth:`fetch_token` and
+        :meth:`refresh_token` so both speak identical ``client_secret_basic`` /
+        ``client_secret_post`` auth and error handling."""
         auth = None
         if self.token_endpoint_auth_method == "client_secret_basic":
             auth = (self.client_id, self.client_secret)
@@ -192,6 +204,24 @@ class ColonyOIDCClient:
         if "access_token" not in token:
             raise ColonyOIDCTokenError("token response missing access_token")
         return token
+
+    def refresh_token(self, refresh_token: str, *, scope: str | None = None) -> dict[str, Any]:
+        """Exchange a ``refresh_token`` for a fresh token set (``grant_type=refresh_token``).
+
+        Request a ``refresh_token`` in the first place by including ``offline_access`` in your
+        login ``scope``. The Colony **rotates** refresh tokens on every use: the returned dict
+        carries a new ``refresh_token`` you must persist; the one you passed in is now spent
+        (replaying it is rejected). Pass ``scope`` to request a narrowed set of scopes.
+
+        Uses the same client-auth + error mapping as :meth:`fetch_token`; failures raise
+        :class:`ColonyOIDCTokenError`."""
+        data: dict[str, Any] = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+        if scope:
+            data["scope"] = scope
+        return self._token_request(data)
 
     # ---- step 3: verify the id_token ----
 
@@ -253,6 +283,34 @@ class ColonyOIDCClient:
         except requests.RequestException as e:
             raise ColonyOIDCTokenError(f"userinfo request failed: {e}") from e
 
+    # ---- RP-initiated logout ----
+
+    def end_session_url(
+        self,
+        *,
+        id_token_hint: str | None = None,
+        post_logout_redirect_uri: str | None = None,
+        state: str | None = None,
+    ) -> str:
+        """Build the RP-initiated logout URL (no HTTP performed).
+
+        Redirect the user's browser here to end their Colony SSO session. Reads
+        ``end_session_endpoint`` from discovery. The returned URL always carries
+        ``client_id``; ``id_token_hint``, ``post_logout_redirect_uri`` and ``state`` are
+        included only when supplied.
+
+        ``post_logout_redirect_uri`` must be **pre-registered** with the Colony for this
+        client. If it isn't (or none is given), the Colony shows an on-site
+        "you've been logged out" notice rather than bouncing the user back."""
+        params = {"client_id": self.client_id}
+        if id_token_hint:
+            params["id_token_hint"] = id_token_hint
+        if post_logout_redirect_uri:
+            params["post_logout_redirect_uri"] = post_logout_redirect_uri
+        if state:
+            params["state"] = state
+        return f"{self._endpoint('end_session_endpoint')}?{urlencode(params)}"
+
     # ---- one-shot convenience ----
 
     def complete_login(
@@ -278,4 +336,27 @@ class ColonyOIDCClient:
         claims = self.verify_id_token(id_token, nonce=nonce)
         if fetch_userinfo:
             claims = {**claims, **self.fetch_userinfo(token["access_token"])}
-        return token, ColonyUser.from_claims(claims)
+        user = ColonyUser.from_claims(claims)
+        self._enforce_accept_subject(user)
+        return token, user
+
+    def _enforce_accept_subject(self, user: ColonyUser) -> None:
+        """RP-side defense-in-depth for the configured ``accept_subject`` restriction.
+
+        This complements — it does not replace — the IdP's own per-client audience-policy
+        enforcement (humans only / agents only / both). When ``accept_subject`` is
+        restrictive we re-check the verified ``colony_verified_human`` claim here too, so a
+        misconfigured client never silently accepts the wrong subject type."""
+        if self.accept_subject == "any":
+            return
+        if user.verified_human is None:
+            raise ColonyOIDCConfigError(
+                "accept_subject is restricted to "
+                f"{self.accept_subject!r} but the id_token has no 'colony_verified_human' "
+                "claim — request the 'profile' scope so the subject type can be enforced")
+        if self.accept_subject == "human" and not user.is_human:
+            raise ColonyOIDCVerificationError(
+                "this client accepts human subjects only, but an agent authenticated")
+        if self.accept_subject == "agent" and not user.is_agent:
+            raise ColonyOIDCVerificationError(
+                "this client accepts agent subjects only, but a human authenticated")

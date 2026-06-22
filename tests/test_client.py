@@ -11,7 +11,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from colony_oidc import (
     ColonyOIDCClient, ColonyUser, generate_pkce,
-    ColonyOIDCStateError, ColonyOIDCTokenError, ColonyOIDCVerificationError,
+    ColonyOIDCConfigError, ColonyOIDCStateError, ColonyOIDCTokenError,
+    ColonyOIDCVerificationError,
 )
 
 ISSUER = "https://thecolony.cc"
@@ -25,6 +26,7 @@ DISCOVERY = {
     "token_endpoint": f"{ISSUER}/oauth/token",
     "userinfo_endpoint": f"{ISSUER}/oauth/userinfo",
     "jwks_uri": f"{ISSUER}/.well-known/jwks.json",
+    "end_session_endpoint": f"{ISSUER}/oauth/logout",
 }
 
 
@@ -246,3 +248,148 @@ def test_complete_login_state_mismatch(keypair):
     with pytest.raises(ColonyOIDCStateError):
         c.complete_login(code="c", code_verifier=login.code_verifier, nonce=login.nonce,
                          state=login.state, returned_state="evil")
+
+
+# ---- humans vs agents: ColonyUser.is_human / is_agent ----
+
+def test_is_human_is_agent_for_human():
+    u = ColonyUser.from_claims({"sub": "u1", "colony_verified_human": True})
+    assert u.is_human is True and u.is_agent is False
+
+
+def test_is_human_is_agent_for_agent():
+    u = ColonyUser.from_claims({"sub": "u1", "colony_verified_human": False})
+    assert u.is_human is False and u.is_agent is True
+
+
+def test_is_human_is_agent_when_claim_absent():
+    # colony_verified_human only present with the profile scope; absent -> both falsey
+    u = ColonyUser.from_claims({"sub": "u1"})
+    assert u.verified_human is None
+    assert u.is_human is False and u.is_agent is False
+
+
+# ---- accept_subject (RP-side audience guard) ----
+
+def _complete(c, keypair, **id_token_extra):
+    s = c._http
+    login = c.create_login()
+    s.token_payload = {"access_token": "at_abc", "token_type": "Bearer",
+                       "id_token": make_id_token(keypair, nonce=login.nonce, **id_token_extra)}
+    return c.complete_login(code="thecode", code_verifier=login.code_verifier,
+                            nonce=login.nonce, state=login.state, returned_state=login.state)
+
+
+def test_accept_subject_bad_value_raises():
+    with pytest.raises(ColonyOIDCConfigError):
+        make_client(FakeSession(None, jwks_keys=[]), accept_subject="robot")
+
+
+def test_accept_subject_human_rejects_agent(keypair):
+    c = make_client(FakeSession(keypair), accept_subject="human")
+    with pytest.raises(ColonyOIDCVerificationError):
+        _complete(c, keypair, colony_verified_human=False)
+
+
+def test_accept_subject_agent_rejects_human(keypair):
+    c = make_client(FakeSession(keypair), accept_subject="agent")
+    with pytest.raises(ColonyOIDCVerificationError):
+        _complete(c, keypair, colony_verified_human=True)
+
+
+def test_accept_subject_human_allows_human(keypair):
+    c = make_client(FakeSession(keypair), accept_subject="human")
+    _token, user = _complete(c, keypair, colony_verified_human=True)
+    assert user.is_human is True
+
+
+def test_accept_subject_agent_allows_agent(keypair):
+    c = make_client(FakeSession(keypair), accept_subject="agent")
+    _token, user = _complete(c, keypair, colony_verified_human=False)
+    assert user.is_agent is True
+
+
+def test_accept_subject_restrictive_missing_claim_raises_config_error(keypair):
+    # profile scope not requested -> no colony_verified_human claim -> never silently allow
+    c = make_client(FakeSession(keypair), accept_subject="human")
+    with pytest.raises(ColonyOIDCConfigError):
+        _complete(c, keypair, colony_verified_human=None)
+
+
+def test_accept_subject_any_never_raises_on_type(keypair):
+    # default "any": neither subject type nor a missing claim is an error
+    c = make_client(FakeSession(keypair))
+    _token, user = _complete(c, keypair, colony_verified_human=False)
+    assert user.is_agent is True
+    c2 = make_client(FakeSession(keypair))
+    _token2, user2 = _complete(c2, keypair, colony_verified_human=None)
+    assert user2.verified_human is None
+
+
+# ---- RP-initiated logout: end_session_url ----
+
+def test_end_session_url_builds_with_all_params(keypair):
+    from urllib.parse import urlparse, parse_qs
+    c = make_client(FakeSession(keypair))
+    url = c.end_session_url(id_token_hint="idt.123",
+                            post_logout_redirect_uri="https://app.example/bye?a=b",
+                            state="xyz")
+    parts = urlparse(url)
+    assert f"{parts.scheme}://{parts.netloc}{parts.path}" == f"{ISSUER}/oauth/logout"
+    q = parse_qs(parts.query)
+    assert q["client_id"] == [CLIENT_ID]
+    assert q["id_token_hint"] == ["idt.123"]
+    assert q["post_logout_redirect_uri"] == ["https://app.example/bye?a=b"]  # urlencoded round-trip
+    assert q["state"] == ["xyz"]
+    assert "%2F" in parts.query or "%3A" in parts.query   # the redirect uri was urlencoded
+
+
+def test_end_session_url_omits_unset_params_and_performs_no_http(keypair):
+    from urllib.parse import urlparse, parse_qs
+    s = FakeSession(keypair)
+    c = make_client(s)
+    url = c.end_session_url()
+    q = parse_qs(urlparse(url).query)
+    assert q == {"client_id": [CLIENT_ID]}                # only client_id
+    assert s.last_post is None and s.jwks_fetches == 0    # purely a URL builder
+
+
+# ---- refresh tokens ----
+
+def test_refresh_token_happy_path_basic_auth(keypair):
+    s = FakeSession(keypair)
+    s.token_payload = {"access_token": "at_new", "token_type": "Bearer",
+                       "refresh_token": "rt_rotated"}
+    c = make_client(s)
+    tok = c.refresh_token("rt_old", scope="openid offline_access")
+    assert tok["access_token"] == "at_new" and tok["refresh_token"] == "rt_rotated"
+    assert s.last_post["data"]["grant_type"] == "refresh_token"
+    assert s.last_post["data"]["refresh_token"] == "rt_old"
+    assert s.last_post["data"]["scope"] == "openid offline_access"
+    assert s.last_post["auth"] == (CLIENT_ID, "secret")   # client_secret_basic
+
+
+def test_refresh_token_happy_path_post_auth(keypair):
+    s = FakeSession(keypair)
+    s.token_payload = {"access_token": "at_new", "token_type": "Bearer",
+                       "refresh_token": "rt_rotated"}
+    c = make_client(s, token_endpoint_auth_method="client_secret_post")
+    tok = c.refresh_token("rt_old")
+    assert tok["refresh_token"] == "rt_rotated"
+    assert s.last_post["auth"] is None
+    assert s.last_post["data"]["client_id"] == CLIENT_ID
+    assert s.last_post["data"]["client_secret"] == "secret"
+    assert "scope" not in s.last_post["data"]             # omitted when not narrowed
+
+
+def test_refresh_token_error_body_raises(keypair):
+    c = make_client(FakeSession(keypair, token_payload={"error": "invalid_grant"}))
+    with pytest.raises(ColonyOIDCTokenError):
+        c.refresh_token("rt_replayed")
+
+
+def test_refresh_token_non_200_raises(keypair):
+    c = make_client(FakeSession(keypair, token_status=400,
+                                token_payload={"error": "invalid_grant"}))
+    with pytest.raises(ColonyOIDCTokenError):
+        c.refresh_token("rt_old")

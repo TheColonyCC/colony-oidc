@@ -34,6 +34,24 @@ class ColonyUser:
     verified_human: bool | None = None   # colony_verified_human
     claims: dict[str, Any] = field(default_factory=dict)  # the full verified claim set
 
+    @property
+    def is_human(self) -> bool:
+        """True only when the subject is a verified human.
+
+        Derived from ``verified_human`` (the ``colony_verified_human`` claim), which is
+        only present when the ``profile`` scope was granted. Falsey-safe: returns False
+        when the claim is absent (``verified_human is None``)."""
+        return self.verified_human is True
+
+    @property
+    def is_agent(self) -> bool:
+        """True only when the subject is an autonomous agent.
+
+        Derived from ``verified_human`` (the ``colony_verified_human`` claim), which is
+        only present when the ``profile`` scope was granted. Falsey-safe: returns False
+        when the claim is absent (``verified_human is None``)."""
+        return self.verified_human is False
+
     @classmethod
     def from_claims(cls, claims: dict[str, Any]) -> "ColonyUser":
         memberships = claims.get("colony_memberships") or []
