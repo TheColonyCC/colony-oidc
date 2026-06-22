@@ -32,6 +32,7 @@ class ColonyUser:
     karma: int | None = None             # colony_karma (needs the colony:karma scope)
     memberships: list[str] = field(default_factory=list)  # colony_memberships
     verified_human: bool | None = None   # colony_verified_human
+    granted_scopes: list[str] = field(default_factory=list)  # the scopes the user actually granted
     claims: dict[str, Any] = field(default_factory=dict)  # the full verified claim set
 
     @property
@@ -53,7 +54,15 @@ class ColonyUser:
         return self.verified_human is False
 
     @classmethod
-    def from_claims(cls, claims: dict[str, Any]) -> "ColonyUser":
+    def from_claims(
+        cls, claims: dict[str, Any], *, granted_scopes: list[str] | None = None
+    ) -> "ColonyUser":
+        """Build a :class:`ColonyUser` from the verified id_token (+ userinfo) claims.
+
+        Pass ``granted_scopes`` (parsed from the token response's ``scope``) to record
+        which scopes the user actually granted — see :meth:`ColonyOIDCClient.complete_login`.
+        Under granular consent the granted set may be **narrower** than what you requested,
+        so read this (or the claims actually present) rather than assuming."""
         memberships = claims.get("colony_memberships") or []
         if isinstance(memberships, str):
             memberships = [m for m in memberships.split() if m]
@@ -67,5 +76,6 @@ class ColonyUser:
             karma=claims.get("colony_karma"),
             memberships=list(memberships),
             verified_human=claims.get("colony_verified_human"),
+            granted_scopes=list(granted_scopes or []),
             claims=claims,
         )

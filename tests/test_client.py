@@ -11,9 +11,12 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from colony_oidc import (
     ColonyOIDCClient, ColonyUser, generate_pkce,
-    ColonyOIDCConfigError, ColonyOIDCStateError, ColonyOIDCTokenError,
+    ColonyOIDCConfigError, ColonyOIDCConsentRequired, ColonyOIDCError,
+    ColonyOIDCLoginRequired, ColonyOIDCStateError, ColonyOIDCTokenError,
     ColonyOIDCVerificationError,
 )
+
+BACKCHANNEL_LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
 
 ISSUER = "https://thecolony.cc"
 CLIENT_ID = "colony_testclient"
@@ -56,6 +59,26 @@ def make_id_token(key, *, kid=KID, aud=CLIENT_ID, iss=ISSUER, nonce="N", exp_del
               "colony_verified_human": False}
     claims.update(extra)
     return jwt.encode(claims, key, algorithm="RS256", headers={"kid": kid})
+
+
+def make_logout_token(key, *, kid=KID, aud=CLIENT_ID, iss=ISSUER, sub="agent_123",
+                      sid="sess_42", events="default", include_iat=True, alg="RS256",
+                      **extra):
+    """A spec-shaped back-channel logout token, with knobs for the negative cases."""
+    now = int(time.time())
+    claims = {"iss": iss, "aud": aud, "exp": now + 120, "jti": "logout-jti-1"}
+    if include_iat:
+        claims["iat"] = now
+    if sub is not None:
+        claims["sub"] = sub
+    if sid is not None:
+        claims["sid"] = sid
+    if events == "default":
+        claims["events"] = {BACKCHANNEL_LOGOUT_EVENT: {}}
+    elif events is not None:
+        claims["events"] = events
+    claims.update(extra)
+    return jwt.encode(claims, key, algorithm=alg, headers={"kid": kid})
 
 
 class FakeResp:
@@ -393,3 +416,209 @@ def test_refresh_token_non_200_raises(keypair):
                                 token_payload={"error": "invalid_grant"}))
     with pytest.raises(ColonyOIDCTokenError):
         c.refresh_token("rt_old")
+
+
+# ---- back-channel logout: validate_logout_token ----
+
+def test_validate_logout_token_valid_returns_sub_and_sid(keypair):
+    c = make_client(FakeSession(keypair))
+    claims = c.validate_logout_token(make_logout_token(keypair))
+    assert claims["sub"] == "agent_123"
+    assert claims["sid"] == "sess_42"
+    assert BACKCHANNEL_LOGOUT_EVENT in claims["events"]
+
+
+def test_validate_logout_token_sub_only(keypair):
+    c = make_client(FakeSession(keypair))
+    claims = c.validate_logout_token(make_logout_token(keypair, sid=None))
+    assert claims["sub"] == "agent_123" and "sid" not in claims
+
+
+def test_validate_logout_token_sid_only(keypair):
+    c = make_client(FakeSession(keypair))
+    claims = c.validate_logout_token(make_logout_token(keypair, sub=None))
+    assert claims["sid"] == "sess_42" and "sub" not in claims
+
+
+def test_validate_logout_token_wrong_issuer(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(make_logout_token(keypair, iss="https://evil.example"))
+
+
+def test_validate_logout_token_wrong_audience(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(make_logout_token(keypair, aud="someone_else"))
+
+
+def test_validate_logout_token_missing_iat(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(make_logout_token(keypair, include_iat=False))
+
+
+def test_validate_logout_token_expired(keypair):
+    c = make_client(FakeSession(keypair))
+    now = int(time.time())
+    tok = make_logout_token(keypair, exp=now - 3600)
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(tok)
+
+
+def test_validate_logout_token_missing_events(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(make_logout_token(keypair, events=None))
+
+
+def test_validate_logout_token_wrong_event_key(keypair):
+    c = make_client(FakeSession(keypair))
+    bad = {"http://schemas.openid.net/event/some-other-event": {}}
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(make_logout_token(keypair, events=bad))
+
+
+def test_validate_logout_token_events_not_object(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(make_logout_token(keypair, events="not-a-dict"))
+
+
+def test_validate_logout_token_nonce_present_rejected(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(make_logout_token(keypair, nonce="N"))
+
+
+def test_validate_logout_token_neither_sub_nor_sid(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(make_logout_token(keypair, sub=None, sid=None))
+
+
+def test_validate_logout_token_bad_signature(keypair):
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    c = make_client(FakeSession(keypair))                 # JWKS has keypair's public key
+    forged = make_logout_token(other)                     # signed by a different key
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(forged)
+
+
+def test_validate_logout_token_alg_none_rejected(keypair):
+    c = make_client(FakeSession(keypair))
+    now = int(time.time())
+    unsigned = jwt.encode(
+        {"iss": ISSUER, "aud": CLIENT_ID, "iat": now, "sub": "agent_123",
+         "events": {BACKCHANNEL_LOGOUT_EVENT: {}}},
+        key="", algorithm="none", headers={"kid": KID})
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_logout_token(unsigned)
+
+
+def test_validate_logout_token_selects_by_kid(keypair):
+    # logout token signed with the second of two JWKS keys -> kid selection must work
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwks = [_public_jwk(keypair, kid="k1"), _public_jwk(other, kid="k2")]
+    c = make_client(FakeSession(keypair, jwks_keys=jwks))
+    claims = c.validate_logout_token(make_logout_token(other, kid="k2"))
+    assert claims["sub"] == "agent_123"
+
+
+# ---- silent SSO (prompt=none) ----
+
+def test_create_silent_login_sets_prompt_none(keypair):
+    from urllib.parse import urlparse, parse_qs
+    c = make_client(FakeSession(keypair))
+    login = c.create_silent_login(scope="openid profile")
+    q = parse_qs(urlparse(login.authorization_url).query)
+    assert q["prompt"] == ["none"]
+    assert q["scope"] == ["openid profile"]
+
+
+def test_create_silent_login_overrides_passed_prompt(keypair):
+    from urllib.parse import urlparse, parse_qs
+    c = make_client(FakeSession(keypair))
+    login = c.create_silent_login(prompt="login")
+    q = parse_qs(urlparse(login.authorization_url).query)
+    assert q["prompt"] == ["none"]
+
+
+def test_raise_for_callback_error_login_required(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCLoginRequired):
+        c.raise_for_callback_error({"error": "login_required"})
+
+
+def test_raise_for_callback_error_consent_required(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCConsentRequired):
+        c.raise_for_callback_error({"error": "consent_required",
+                                    "error_description": "needs consent"})
+
+
+def test_raise_for_callback_error_generic(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCError) as ei:
+        c.raise_for_callback_error({"error": "interaction_required"})
+    # not one of the typed silent-SSO subclasses
+    assert not isinstance(ei.value, (ColonyOIDCLoginRequired, ColonyOIDCConsentRequired))
+
+
+def test_raise_for_callback_error_noop_on_clean_code(keypair):
+    c = make_client(FakeSession(keypair))
+    assert c.raise_for_callback_error({"code": "abc", "state": "xyz"}) is None
+
+
+# ---- granular consent: granted_scopes ----
+
+def test_granted_scopes_reflects_token_response(keypair):
+    s = FakeSession(keypair)
+    c = make_client(s)
+    login = c.create_login(scope="openid profile email colony:karma")
+    # user declined email + colony:karma at the consent screen
+    s.token_payload = {"access_token": "at_abc", "token_type": "Bearer",
+                       "scope": "openid profile",
+                       "id_token": make_id_token(keypair, nonce=login.nonce)}
+    _token, user = c.complete_login(
+        code="thecode", code_verifier=login.code_verifier, nonce=login.nonce,
+        state=login.state, returned_state=login.state)
+    assert user.granted_scopes == ["openid", "profile"]
+    assert "email" not in user.granted_scopes
+
+
+def test_granted_scopes_empty_when_absent(keypair):
+    s = FakeSession(keypair)
+    c = make_client(s)
+    login = c.create_login()
+    s.token_payload = {"access_token": "at_abc", "token_type": "Bearer",
+                       "id_token": make_id_token(keypair, nonce=login.nonce)}
+    _token, user = c.complete_login(
+        code="thecode", code_verifier=login.code_verifier, nonce=login.nonce,
+        state=login.state, returned_state=login.state)
+    assert user.granted_scopes == []
+
+
+# ---- multi-key JWKS / rotation robustness ----
+
+def test_id_token_verifies_with_either_of_two_keys(keypair):
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwks = [_public_jwk(keypair, kid="k1"), _public_jwk(other, kid="k2")]
+    # token signed by the FIRST kid
+    c1 = make_client(FakeSession(keypair, jwks_keys=jwks))
+    assert c1.verify_id_token(make_id_token(keypair, kid="k1", nonce="N"),
+                              nonce="N")["sub"] == "agent_123"
+    # token signed by the SECOND kid (same JWKS) -> kid selection picks the right key
+    c2 = make_client(FakeSession(other, jwks_keys=jwks))
+    assert c2.verify_id_token(make_id_token(other, kid="k2", nonce="N"),
+                              nonce="N")["sub"] == "agent_123"
+
+
+def test_unknown_kid_refetches_once_then_fails(keypair):
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    s = FakeSession(other, jwks_keys=[_public_jwk(keypair, kid="k1")])
+    c = make_client(s)
+    token = make_id_token(other, kid="unknown-kid", nonce="N")
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.verify_id_token(token, nonce="N")
+    assert s.jwks_fetches == 2                            # cached miss forced one refetch

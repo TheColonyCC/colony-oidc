@@ -26,7 +26,7 @@ import base64
 import hashlib
 import json
 import secrets
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlencode
 
 import jwt
@@ -35,6 +35,9 @@ from jwt.algorithms import RSAAlgorithm
 
 from .exceptions import (
     ColonyOIDCConfigError,
+    ColonyOIDCConsentRequired,
+    ColonyOIDCError,
+    ColonyOIDCLoginRequired,
     ColonyOIDCStateError,
     ColonyOIDCTokenError,
     ColonyOIDCVerificationError,
@@ -152,6 +155,41 @@ class ColonyOIDCClient:
         url = f"{self._endpoint('authorization_endpoint')}?{urlencode(params)}"
         return LoginRequest(authorization_url=url, state=state, nonce=nonce,
                             code_verifier=verifier, redirect_uri=redirect)
+
+    def create_silent_login(self, **kwargs: Any) -> LoginRequest:
+        """Build a **silent SSO** login request (``prompt=none``).
+
+        Convenience wrapper over :meth:`create_login` that forces ``prompt="none"``: the
+        IdP will not show any UI. Use it (typically in a hidden iframe) to re-authenticate
+        a user who already has a Colony session without an interactive redirect. The
+        callback yields one of three outcomes — ``?code=...`` on success, or
+        ``?error=login_required`` / ``?error=consent_required`` on failure — which
+        :meth:`raise_for_callback_error` turns into typed exceptions.
+
+        Accepts the same keyword arguments as :meth:`create_login` (any ``prompt`` you pass
+        is overridden to ``"none"``)."""
+        kwargs["prompt"] = "none"
+        return self.create_login(**kwargs)
+
+    def raise_for_callback_error(self, params: Mapping[str, str]) -> None:
+        """Inspect the callback query params and raise on any OAuth ``error``.
+
+        Call this **first** on the callback, before :meth:`complete_login`. When the IdP
+        returns an ``error`` parameter — chiefly the silent-SSO (``prompt=none``) outcomes
+        ``login_required`` and ``consent_required`` — this raises the matching typed
+        exception (:class:`ColonyOIDCLoginRequired` / :class:`ColonyOIDCConsentRequired`),
+        or a generic :class:`ColonyOIDCError` for any other ``error`` value. Returns
+        cleanly (``None``) when there is no ``error`` — proceed to :meth:`complete_login`."""
+        error = params.get("error")
+        if not error:
+            return
+        description = params.get("error_description") or ""
+        detail = f"{error}: {description}" if description else error
+        if error == "login_required":
+            raise ColonyOIDCLoginRequired(detail)
+        if error == "consent_required":
+            raise ColonyOIDCConsentRequired(detail)
+        raise ColonyOIDCError(f"authorization error: {detail}")
 
     # ---- step 2: exchange the code for tokens ----
 
@@ -271,6 +309,66 @@ class ColonyOIDCClient:
             raise ColonyOIDCVerificationError("id_token nonce mismatch (possible replay)")
         return claims
 
+    # ---- back-channel logout ----
+
+    BACKCHANNEL_LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
+
+    def validate_logout_token(self, logout_token: str) -> dict[str, Any]:
+        """Validate a back-channel ``logout_token`` (OIDC Back-Channel Logout 1.0 §2.4/§2.6).
+
+        Call this from your registered back-channel logout endpoint with the
+        ``logout_token`` form field the Colony POSTs there. Returns the validated claims
+        (always carrying ``sub`` and/or ``sid``) so you can terminate that subject's /
+        session's local session; raises :class:`ColonyOIDCVerificationError` on **any**
+        validation failure.
+
+        Verified, per spec:
+
+        - RS256 signature against the live JWKS (same kid-selection + single rotation
+          refetch as :meth:`verify_id_token`); ``alg: none`` / non-RS256 is rejected.
+        - ``iss`` == issuer, ``aud`` == this client_id, and ``iat`` is **required**
+          (``exp`` is validated when present).
+        - an ``events`` claim that is a JSON object containing the
+          ``http://schemas.openid.net/event/backchannel-logout`` member.
+        - **at least one** of ``sub`` / ``sid`` (a logout token with neither is invalid).
+        - **no** ``nonce`` claim (its presence proves the token is an id_token, not a
+          logout token)."""
+        try:
+            header = jwt.get_unverified_header(logout_token)
+        except jwt.PyJWTError as e:
+            raise ColonyOIDCVerificationError(f"malformed logout_token: {e}") from e
+        alg = header.get("alg")
+        if alg != "RS256":
+            raise ColonyOIDCVerificationError(
+                f"logout_token alg must be RS256, got {alg!r}")
+        key = self._signing_key(header.get("kid"))
+        try:
+            claims = jwt.decode(
+                logout_token, key, algorithms=["RS256"], audience=self.client_id,
+                issuer=self.issuer, leeway=self.leeway,
+                options={"require": ["iat", "aud", "iss"]},
+            )
+        except jwt.PyJWTError as e:
+            raise ColonyOIDCVerificationError(
+                f"logout_token verification failed: {e}") from e
+        # §2.4: a logout token MUST NOT contain a nonce (that would be an id_token).
+        if "nonce" in claims:
+            raise ColonyOIDCVerificationError(
+                "logout_token must not contain a 'nonce' claim")
+        # §2.4: MUST have a sub and/or sid identifying the subject/session to log out.
+        if claims.get("sub") is None and claims.get("sid") is None:
+            raise ColonyOIDCVerificationError(
+                "logout_token must contain a 'sub' and/or 'sid' claim")
+        # §2.4: the events claim asserts this is a back-channel logout event.
+        events = claims.get("events")
+        if not isinstance(events, dict):
+            raise ColonyOIDCVerificationError(
+                "logout_token must contain an 'events' object")
+        if self.BACKCHANNEL_LOGOUT_EVENT not in events:
+            raise ColonyOIDCVerificationError(
+                "logout_token 'events' is missing the back-channel-logout event member")
+        return claims
+
     # ---- userinfo (optional) ----
 
     def fetch_userinfo(self, access_token: str) -> dict[str, Any]:
@@ -336,7 +434,10 @@ class ColonyOIDCClient:
         claims = self.verify_id_token(id_token, nonce=nonce)
         if fetch_userinfo:
             claims = {**claims, **self.fetch_userinfo(token["access_token"])}
-        user = ColonyUser.from_claims(claims)
+        # Under granular consent the user may grant fewer scopes than requested; the token
+        # response's `scope` is the authoritative granted set. Surface it on the user.
+        granted_scopes = [s for s in str(token.get("scope", "")).split() if s]
+        user = ColonyUser.from_claims(claims, granted_scopes=granted_scopes)
         self._enforce_accept_subject(user)
         return token, user
 

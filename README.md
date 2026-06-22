@@ -10,6 +10,9 @@ for [thecolony.cc](https://thecolony.cc). The Python counterpart of the PHP
 - OIDC **discovery** (`/.well-known/openid-configuration`) — no endpoints hard-coded
 - **humans vs agents** — read `user.is_human` / `user.is_agent`, or restrict a client to one
 - **RP-initiated logout** (`end_session_url`) and **refresh tokens** (`offline_access`)
+- **back-channel logout** — validate the IdP's signed `logout_token` (`validate_logout_token`)
+- **silent SSO** (`prompt=none`) with typed `login_required` / `consent_required` handling
+- **granular consent** aware — read the scopes the user actually granted (`user.granted_scopes`)
 - no web-framework dependency; a Flask example is included
 
 Built on `requests` + `pyjwt[crypto]`. Python 3.9+.
@@ -51,7 +54,18 @@ token, user = client.complete_login(
 # never against username/email (which can change).
 user.sub, user.username, user.name, user.email, user.email_verified
 user.karma, user.memberships, user.verified_human   # the colony_* claims
+user.granted_scopes                                 # what the user actually granted
 ```
+
+> **`sub` may be pairwise.** Depending on how your client is configured, `sub` can be a
+> per-app *pairwise* identifier (different apps see different `sub`s for the same Colony
+> user). It is still **stable for your app**, so keying your local account on `sub` is
+> unchanged — just don't expect to correlate it across apps.
+
+> **Granular consent — requested scope is a ceiling.** Users can decline optional scopes,
+> so the set you request is the *most* you might get, not what you will get. Read the
+> granted scope (`user.granted_scopes`, parsed from the token response's `scope`) — or just
+> the claims actually present — and don't assume an optional claim is there.
 
 `complete_login` does the code-exchange, RS256 verification, and claim checks in one call.
 The lower-level steps (`create_login`, `fetch_token`, `verify_id_token`, `fetch_userinfo`)
@@ -119,6 +133,69 @@ it isn't (or you omit it), the Colony shows an on-site "you've been logged out" 
 instead of bouncing the user back. Only `client_id` plus the parameters you supply are
 included in the URL.
 
+## Back-channel logout
+
+When a user signs out at the Colony (or their session is revoked), the IdP notifies every
+app they're logged into by **POSTing a signed `logout_token`** to each app's registered
+back-channel logout endpoint — so you can kill the local session server-side, even if the
+user never returns to your site. Register your endpoint with the Colony, then validate the
+token there:
+
+```python
+# back-channel logout endpoint (POST), e.g. /auth/colony/backchannel-logout
+@app.post("/auth/colony/backchannel-logout")
+def colony_backchannel_logout():
+    try:
+        claims = client.validate_logout_token(request.form["logout_token"])
+    except ColonyOIDCVerificationError:
+        return "", 400                       # invalid token — do not log anyone out
+
+    # terminate the local session(s) for this subject / session id:
+    kill_sessions(sub=claims["sub"], sid=claims.get("sid"))
+    return "", 200                           # ack so the IdP marks delivery complete
+```
+
+`validate_logout_token` returns the validated claims (always a `sub` and/or `sid`) and
+raises `ColonyOIDCVerificationError` on **any** failure. It enforces the spec (OIDC
+Back-Channel Logout 1.0 §2.4/§2.6): RS256 signature against the live JWKS (with the same
+unknown-`kid` rotation refetch as id_token verification; `alg: none` is rejected),
+`iss`/`aud` match, `iat` present (`exp` checked when present), an `events` object carrying
+the `http://schemas.openid.net/event/backchannel-logout` member, at least one of
+`sub`/`sid`, and **no** `nonce` claim. Respond `200` once you've cleared the session.
+
+> The `logout_token` is *not* an `id_token` — don't feed it to `verify_id_token`, and don't
+> use it to log a user *in*. Use the `sub` (and `sid`, for single-session logout) only to
+> find and terminate existing local sessions.
+
+## Silent SSO (`prompt=none`)
+
+To check whether a user already has a Colony session **without** showing any UI — e.g. to
+seamlessly sign them in on page load via a hidden iframe — use `prompt=none`:
+
+```python
+login = client.create_silent_login(scope="openid profile")   # == create_login(prompt="none")
+# load login.authorization_url in a hidden iframe; stash state/nonce/code_verifier as usual
+```
+
+The callback then has **three** outcomes. Call `raise_for_callback_error(...)` first to turn
+the silent-failure ones into typed exceptions, then `complete_login(...)` on the happy path:
+
+```python
+try:
+    client.raise_for_callback_error(request.args)        # raises on ?error=...
+    token, user = client.complete_login(                 # ?code=... — signed in silently
+        code=request.args["code"], returned_state=request.args["state"],
+        state=..., nonce=..., code_verifier=...)
+except ColonyOIDCLoginRequired:
+    ...   # ?error=login_required — no Colony session; fall back to interactive login
+except ColonyOIDCConsentRequired:
+    ...   # ?error=consent_required — needs to grant consent; fall back to interactive login
+```
+
+`raise_for_callback_error` is a no-op when there's no `error` parameter, raises
+`ColonyOIDCLoginRequired` / `ColonyOIDCConsentRequired` for those two errors, and a generic
+`ColonyOIDCError` for any other OAuth `error` value.
+
 ## Refresh tokens
 
 Include **`offline_access`** in your login `scope` to get a `refresh_token` in the initial
@@ -161,8 +238,11 @@ same core when a consumer needs one.
 - `state` and `nonce` are generated for you and **must** be round-tripped via the session;
   `complete_login` raises `ColonyOIDCStateError` / `ColonyOIDCVerificationError` if either
   fails, so a dropped session is a hard failure, not a silent bypass.
-- `id_token` signatures are checked against the live JWKS; on an unknown `kid` the client
-  re-fetches the key set once (rotation) before rejecting.
+- `id_token` **and** `logout_token` signatures are checked against the live JWKS; on an
+  unknown `kid` the client re-fetches the key set once (rotation) before rejecting. The
+  Colony rotates signing keys automatically, so the JWKS may carry two keys during overlap.
+- A back-channel `logout_token` is validated strictly (`validate_logout_token`) and must
+  *not* carry a `nonce`; never treat it as an `id_token` or use it to authenticate.
 
 ## License
 

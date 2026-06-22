@@ -18,4 +18,19 @@ class ColonyOIDCTokenError(ColonyOIDCError):
 
 
 class ColonyOIDCVerificationError(ColonyOIDCError):
-    """The id_token failed signature, claim, or nonce verification."""
+    """The id_token (or logout_token) failed signature, claim, or nonce verification."""
+
+
+class ColonyOIDCLoginRequired(ColonyOIDCError):
+    """A silent (``prompt=none``) auth attempt failed because the user needs to log in.
+
+    Raised by :meth:`ColonyOIDCClient.raise_for_callback_error` when the IdP returns
+    ``?error=login_required`` — fall back to an interactive login."""
+
+
+class ColonyOIDCConsentRequired(ColonyOIDCError):
+    """A silent (``prompt=none``) auth attempt failed because the user must grant consent.
+
+    Raised by :meth:`ColonyOIDCClient.raise_for_callback_error` when the IdP returns
+    ``?error=consent_required`` — fall back to an interactive login so consent can be
+    collected."""
