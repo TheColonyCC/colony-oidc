@@ -4,6 +4,8 @@ from .models import ColonyUser, LoginRequest
 from .exceptions import (
     ColonyOIDCError,
     ColonyOIDCConfigError,
+    ColonyOIDCConsentRequired,
+    ColonyOIDCLoginRequired,
     ColonyOIDCStateError,
     ColonyOIDCTokenError,
     ColonyOIDCVerificationError,
@@ -15,4 +17,5 @@ __all__ = [
     "ColonyUser", "LoginRequest",
     "ColonyOIDCError", "ColonyOIDCConfigError", "ColonyOIDCStateError",
     "ColonyOIDCTokenError", "ColonyOIDCVerificationError",
+    "ColonyOIDCLoginRequired", "ColonyOIDCConsentRequired",
 ]
