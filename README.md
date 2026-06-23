@@ -13,6 +13,8 @@ for [thecolony.cc](https://thecolony.cc). The Python counterpart of the PHP
 - **back-channel logout** — validate the IdP's signed `logout_token` (`validate_logout_token`)
 - **silent SSO** (`prompt=none`) with typed `login_required` / `consent_required` handling
 - **granular consent** aware — read the scopes the user actually granted (`user.granted_scopes`)
+- **`private_key_jwt`** client auth (RFC 7523) — authenticate with your own signing key, no shared secret
+- **PAR** (RFC 9126) — push the authorization request server-side (`use_par=True`)
 - no web-framework dependency; a Flask example is included
 
 Built on `requests` + `pyjwt[crypto]`. Python 3.9+.
@@ -214,6 +216,44 @@ The Colony **rotates** refresh tokens on every use: each call returns a *new*
 `refresh_token` you must store, and the one you just spent is rejected if replayed. Pass
 `scope=` to request a narrowed set of scopes. Errors map to `ColonyOIDCTokenError`, the
 same as `fetch_token`.
+
+## Client authentication: `private_key_jwt`
+
+By default the client authenticates to the token endpoint with its **client secret**
+(`client_secret_basic`, or `client_secret_post`). If your client is registered for
+**`private_key_jwt`** (RFC 7523), authenticate with your own signing key instead — there is
+no shared secret to store or leak:
+
+```python
+client = ColonyOIDCClient(
+    client_id="colony_...",
+    redirect_uri="https://app.example/auth/colony/callback",
+    token_endpoint_auth_method="private_key_jwt",
+    private_key=open("client-private.pem").read(),   # PEM (RSA or EC), or a cryptography key
+    private_key_id="my-key-1",                       # optional `kid` (omit for a single key)
+    signing_alg="RS256",                             # RS/PS/ES 256/384/512
+)
+```
+
+The client signs a short-lived, single-use assertion (`iss = sub = client_id`, audience the
+token endpoint, fresh `jti`) on every token, refresh, and PAR request — `client_secret` is
+not required (and not sent). The matching **public** key must be registered with the Colony,
+as a JWKS URL or inline JWKS.
+
+## Pushed Authorization Requests (PAR)
+
+With **PAR** (RFC 9126) the authorization parameters are sent to the IdP over a back channel
+first; the browser is then redirected with only a short, opaque `request_uri`. Turn it on per
+call or for the whole client:
+
+```python
+login = client.create_login(use_par=True)            # or ColonyOIDCClient(..., use_par=True)
+# login.authorization_url now carries just client_id + request_uri
+```
+
+Everything else (the `state`/`nonce`/`code_verifier` you stash, and `complete_login` on the
+callback) is unchanged. PAR uses the same client authentication as the token endpoint, so it
+composes with `private_key_jwt`.
 
 ## Flask
 

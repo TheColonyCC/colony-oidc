@@ -26,6 +26,7 @@ import base64
 import hashlib
 import json
 import secrets
+import time
 from typing import Any, Mapping
 from urllib.parse import urlencode
 
@@ -47,6 +48,22 @@ from .models import ColonyUser, LoginRequest
 DEFAULT_ISSUER = "https://thecolony.cc"
 DEFAULT_SCOPE = "openid profile email"
 
+# Client authentication methods we support at the token / PAR endpoints.
+TOKEN_AUTH_METHODS = ("client_secret_basic", "client_secret_post", "private_key_jwt")
+
+# private_key_jwt (RFC 7523 / RFC 7521 §4.2). The Colony accepts the same
+# asymmetric algorithm set the IdP advertises in discovery's
+# ``token_endpoint_auth_signing_alg_values_supported``.
+_CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+_CLIENT_ASSERTION_ALGS = (
+    "RS256", "RS384", "RS512",
+    "PS256", "PS384", "PS512",
+    "ES256", "ES384", "ES512",
+)
+# Each assertion is single-use (fresh jti) and short-lived; the IdP caps the
+# accepted lifetime at 5 min, so stay well under it.
+_ASSERTION_LIFETIME = 60
+
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
@@ -63,7 +80,7 @@ class ColonyOIDCClient:
     def __init__(
         self,
         client_id: str,
-        client_secret: str,
+        client_secret: str | None = None,
         redirect_uri: str | None = None,
         *,
         issuer: str = DEFAULT_ISSUER,
@@ -73,10 +90,28 @@ class ColonyOIDCClient:
         leeway: int = 30,
         timeout: float = 15.0,
         token_endpoint_auth_method: str = "client_secret_basic",
+        private_key: Any = None,
+        private_key_id: str | None = None,
+        signing_alg: str = "RS256",
+        use_par: bool = False,
         accept_subject: str = "any",
     ) -> None:
-        if not client_id or not client_secret:
-            raise ColonyOIDCConfigError("client_id and client_secret are required")
+        if not client_id:
+            raise ColonyOIDCConfigError("client_id is required")
+        if token_endpoint_auth_method not in TOKEN_AUTH_METHODS:
+            raise ColonyOIDCConfigError(
+                "token_endpoint_auth_method must be one of " + ", ".join(TOKEN_AUTH_METHODS))
+        if token_endpoint_auth_method == "private_key_jwt":
+            # Asymmetric client auth: a signing key replaces the shared secret.
+            if not private_key:
+                raise ColonyOIDCConfigError(
+                    "private_key is required for token_endpoint_auth_method='private_key_jwt'")
+            if signing_alg not in _CLIENT_ASSERTION_ALGS:
+                raise ColonyOIDCConfigError(
+                    "signing_alg must be one of " + ", ".join(_CLIENT_ASSERTION_ALGS))
+        elif not client_secret:
+            raise ColonyOIDCConfigError(
+                f"client_secret is required for token_endpoint_auth_method={token_endpoint_auth_method!r}")
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
@@ -84,10 +119,11 @@ class ColonyOIDCClient:
         self.scope = scope
         self.leeway = leeway
         self.timeout = timeout
-        if token_endpoint_auth_method not in ("client_secret_basic", "client_secret_post"):
-            raise ColonyOIDCConfigError(
-                "token_endpoint_auth_method must be client_secret_basic or client_secret_post")
         self.token_endpoint_auth_method = token_endpoint_auth_method
+        self.private_key = private_key
+        self.private_key_id = private_key_id
+        self.signing_alg = signing_alg
+        self.use_par = use_par
         if accept_subject not in ("any", "human", "agent"):
             raise ColonyOIDCConfigError(
                 "accept_subject must be 'any', 'human', or 'agent'")
@@ -130,6 +166,7 @@ class ColonyOIDCClient:
         nonce: str | None = None,
         code_verifier: str | None = None,
         prompt: str | None = None,
+        use_par: bool | None = None,
         **extra: str,
     ) -> LoginRequest:
         redirect = redirect_uri or self.redirect_uri
@@ -152,9 +189,45 @@ class ColonyOIDCClient:
         if prompt:
             params["prompt"] = prompt
         params.update(extra)
-        url = f"{self._endpoint('authorization_endpoint')}?{urlencode(params)}"
+        authorization_endpoint = self._endpoint("authorization_endpoint")
+        if self.use_par if use_par is None else use_par:
+            # RFC 9126: push the parameters server-side, then send the browser to the
+            # authorization endpoint with just client_id + the issued one-time request_uri.
+            request_uri = self._pushed_authorization_request(params)
+            query = urlencode({"client_id": self.client_id, "request_uri": request_uri})
+        else:
+            query = urlencode(params)
+        url = f"{authorization_endpoint}?{query}"
         return LoginRequest(authorization_url=url, state=state, nonce=nonce,
                             code_verifier=verifier, redirect_uri=redirect)
+
+    def _pushed_authorization_request(self, params: Mapping[str, str]) -> str:
+        """Push the authorization ``params`` to the PAR endpoint (RFC 9126) and return the
+        issued one-time ``request_uri``.
+
+        Authenticates with the same client credential as the token endpoint
+        (:meth:`_client_auth`), so ``private_key_jwt`` and ``client_secret_*`` clients both
+        work. Reads ``pushed_authorization_request_endpoint`` from discovery; raises
+        :class:`ColonyOIDCConfigError` if the IdP doesn't advertise PAR, and
+        :class:`ColonyOIDCError` on a transport or protocol failure."""
+        endpoint = self._endpoint("pushed_authorization_request_endpoint")
+        data = dict(params)
+        auth = self._client_auth(data)
+        try:
+            r = self._http.post(endpoint, data=data, auth=auth,
+                                 headers={"Accept": "application/json"}, timeout=self.timeout)
+        except requests.RequestException as e:
+            raise ColonyOIDCError(f"PAR request failed: {e}") from e
+        if r.status_code not in (200, 201):
+            raise ColonyOIDCError(f"PAR endpoint returned {r.status_code}: {r.text[:300]}")
+        try:
+            body = r.json()
+        except ValueError as e:
+            raise ColonyOIDCError("PAR endpoint did not return JSON") from e
+        request_uri = body.get("request_uri")
+        if not request_uri:
+            raise ColonyOIDCError("PAR response missing request_uri")
+        return str(request_uri)
 
     def create_silent_login(self, **kwargs: Any) -> LoginRequest:
         """Build a **silent SSO** login request (``prompt=none``).
@@ -214,17 +287,50 @@ class ColonyOIDCClient:
         }
         return self._token_request(data)
 
+    def _client_auth(self, data: dict[str, Any]) -> tuple[str, str] | None:
+        """Apply the configured client authentication to an outgoing token/PAR request.
+
+        Mutates ``data`` in place — adding the ``private_key_jwt`` assertion or the
+        POST-body ``client_id``/``client_secret`` — and returns the HTTP Basic-auth
+        tuple for ``requests`` (or ``None`` when the credential travels in the body).
+        Shared by :meth:`fetch_token`, :meth:`refresh_token` and
+        :meth:`_pushed_authorization_request` so all three authenticate identically."""
+        if self.token_endpoint_auth_method == "private_key_jwt":
+            data["client_assertion_type"] = _CLIENT_ASSERTION_TYPE
+            data["client_assertion"] = self._build_client_assertion()
+            return None
+        if self.token_endpoint_auth_method == "client_secret_post":
+            data["client_id"] = self.client_id
+            data["client_secret"] = self.client_secret or ""
+            return None
+        return (self.client_id, self.client_secret or "")  # client_secret_basic
+
+    def _build_client_assertion(self) -> str:
+        """Build a signed ``private_key_jwt`` client-authentication assertion (RFC 7523).
+
+        ``iss`` and ``sub`` are the client_id; ``aud`` is the token endpoint (the Colony
+        accepts that or the issuer); a fresh ``jti`` plus a short ``exp`` make it
+        single-use and replay-bounded. Signed with the configured ``private_key`` and
+        ``signing_alg`` (an RS/PS/ES 256/384/512 key). The same assertion authenticates
+        the token, refresh and PAR requests."""
+        now = int(time.time())
+        claims = {
+            "iss": self.client_id,
+            "sub": self.client_id,
+            "aud": self._endpoint("token_endpoint"),
+            "jti": secrets.token_urlsafe(32),
+            "iat": now,
+            "exp": now + _ASSERTION_LIFETIME,
+        }
+        headers = {"kid": self.private_key_id} if self.private_key_id else None
+        return jwt.encode(claims, self.private_key, algorithm=self.signing_alg, headers=headers)
+
     def _token_request(self, data: dict[str, Any]) -> dict[str, Any]:
         """POST the token endpoint with the configured client auth, mapping any failure to
         :class:`ColonyOIDCTokenError`. Shared by :meth:`fetch_token` and
-        :meth:`refresh_token` so both speak identical ``client_secret_basic`` /
-        ``client_secret_post`` auth and error handling."""
-        auth = None
-        if self.token_endpoint_auth_method == "client_secret_basic":
-            auth = (self.client_id, self.client_secret)
-        else:  # client_secret_post
-            data["client_id"] = self.client_id
-            data["client_secret"] = self.client_secret
+        :meth:`refresh_token` so both speak identical client authentication (secret or
+        ``private_key_jwt``) and error handling."""
+        auth = self._client_auth(data)
         try:
             r = self._http.post(self._endpoint("token_endpoint"), data=data, auth=auth,
                                  headers={"Accept": "application/json"}, timeout=self.timeout)
