@@ -15,6 +15,7 @@ for [thecolony.cc](https://thecolony.cc). The Python counterpart of the PHP
 - **granular consent** aware — read the scopes the user actually granted (`user.granted_scopes`)
 - **`private_key_jwt`** client auth (RFC 7523) — authenticate with your own signing key, no shared secret
 - **PAR** (RFC 9126) — push the authorization request server-side (`use_par=True`)
+- **DPoP** (RFC 9449) — sender-constrain your tokens to a held key (`dpop=True`)
 - no web-framework dependency; a Flask example is included
 
 Built on `requests` + `pyjwt[crypto]`. Python 3.9+.
@@ -254,6 +255,33 @@ login = client.create_login(use_par=True)            # or ColonyOIDCClient(..., 
 Everything else (the `state`/`nonce`/`code_verifier` you stash, and `complete_login` on the
 callback) is unchanged. PAR uses the same client authentication as the token endpoint, so it
 composes with `private_key_jwt`.
+
+## DPoP — sender-constrained tokens (RFC 9449)
+
+**DPoP** binds your access + refresh tokens to a key the client holds, so a stolen token is
+useless without the matching private key. Turn it on and the client does the rest:
+
+```python
+client = ColonyOIDCClient(
+    client_id="colony_...", client_secret="...",
+    redirect_uri="https://app.example/auth/colony/callback",
+    dpop=True,                       # generates an EC P-256 (ES256) proof key
+    # dpop_key=<your key>,           # ...or supply your own (PEM or a cryptography key)
+    # dpop_alg="ES256",              # ES/RS/PS 256/384/512
+)
+```
+
+With DPoP enabled:
+
+- every token + refresh request carries a `DPoP` proof, and the Colony returns the token as
+  `token_type: "DPoP"`, bound to your key's thumbprint;
+- `fetch_userinfo(access_token)` automatically presents the token with the **`DPoP`** auth
+  scheme (not `Bearer`) and a proof carrying `ath` bound to that token;
+- the refresh token is bound too — `refresh_token(...)` proves possession of the same key.
+
+The client holds one proof key for its lifetime; generate a fresh `ColonyOIDCClient` (or pass
+a new `dpop_key`) per session if you want per-session keys. DPoP composes with
+`private_key_jwt` — the proof and the client assertion travel together.
 
 ## Flask
 

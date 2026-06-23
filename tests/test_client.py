@@ -771,3 +771,109 @@ def test_no_par_when_not_requested(keypair):
     q = parse_qs(urlparse(login.authorization_url).query)
     assert "code_challenge" in q and "request_uri" not in q
     assert s.par_post is None                                      # PAR endpoint untouched
+
+
+# ---- DPoP — sender-constrained tokens (RFC 9449) ----
+
+class DpopSession(FakeSession):
+    """FakeSession that captures the request headers (where DPoP proofs ride)."""
+    def __init__(self, key, **kw):
+        super().__init__(key, **kw)
+        self.token_headers = None
+        self.userinfo_headers = None
+
+    def post(self, url, data=None, auth=None, **kw):
+        if url.endswith("/oauth/token"):
+            self.token_headers = kw.get("headers") or {}
+        return super().post(url, data=data, auth=auth, **kw)
+
+    def get(self, url, **kw):
+        if url.endswith("/userinfo"):
+            self.userinfo_headers = kw.get("headers") or {}
+        return super().get(url, **kw)
+
+
+def _decode_dpop(proof, client, alg="ES256"):
+    return jwt.decode(proof, client._dpop_key.public_key(), algorithms=[alg],
+                      options={"verify_aud": False})
+
+
+def test_dpop_token_request_carries_a_proof(keypair):
+    s = DpopSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, "secret", discovery=DISCOVERY, session=s, dpop=True)
+    c.fetch_token("authcode", "verifier123")
+    proof = s.token_headers["DPoP"]
+    hdr = jwt.get_unverified_header(proof)
+    assert hdr["typ"] == "dpop+jwt" and hdr["alg"] == "ES256"
+    assert hdr["jwk"]["kty"] == "EC"
+    assert not any(p in hdr["jwk"] for p in ("d", "p", "q"))        # public key only
+    claims = _decode_dpop(proof, c)                                 # verifies signature
+    assert claims["htm"] == "POST" and claims["htu"] == TOKEN_ENDPOINT
+    assert "ath" not in claims and claims["jti"]                    # no ath at the token endpoint
+
+
+def test_dpop_userinfo_uses_dpop_scheme_with_ath(keypair):
+    s = DpopSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, "secret", discovery=DISCOVERY, session=s, dpop=True)
+    c.fetch_userinfo("at_abc")
+    assert s.userinfo_headers["Authorization"] == "DPoP at_abc"     # not Bearer
+    claims = _decode_dpop(s.userinfo_headers["DPoP"], c)
+    assert claims["htm"] == "GET" and claims["htu"].endswith("/userinfo")
+    assert claims["ath"] == _b64url(hashlib.sha256(b"at_abc").digest())
+
+
+def test_dpop_disabled_is_plain_bearer(keypair):
+    s = DpopSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, "secret", discovery=DISCOVERY, session=s)  # no dpop
+    c.fetch_token("c", "v")
+    c.fetch_userinfo("at_abc")
+    assert "DPoP" not in (s.token_headers or {})
+    assert s.userinfo_headers["Authorization"] == "Bearer at_abc"
+    assert "DPoP" not in s.userinfo_headers
+
+
+def test_dpop_jti_is_unique_per_request(keypair):
+    s = DpopSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, "secret", discovery=DISCOVERY, session=s, dpop=True)
+    c.fetch_token("c", "v")
+    j1 = _decode_dpop(s.token_headers["DPoP"], c)["jti"]
+    c.fetch_token("c", "v")
+    j2 = _decode_dpop(s.token_headers["DPoP"], c)["jti"]
+    assert j1 != j2
+
+
+def test_dpop_rsa_alg(keypair):
+    s = DpopSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, "secret", discovery=DISCOVERY, session=s,
+                         dpop=True, dpop_alg="RS256")
+    c.fetch_token("c", "v")
+    hdr = jwt.get_unverified_header(s.token_headers["DPoP"])
+    assert hdr["alg"] == "RS256" and hdr["jwk"]["kty"] == "RSA"
+    _decode_dpop(s.token_headers["DPoP"], c, alg="RS256")           # verifies signature
+
+
+def test_dpop_supplied_key_is_used(keypair):
+    from cryptography.hazmat.primitives.asymmetric import ec
+    k = ec.generate_private_key(ec.SECP256R1())
+    s = DpopSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, "secret", discovery=DISCOVERY, session=s, dpop_key=k)
+    assert c.dpop_enabled and c._dpop_key is k
+    c.fetch_token("c", "v")
+    jwt.decode(s.token_headers["DPoP"], k.public_key(), algorithms=["ES256"],
+               options={"verify_aud": False})                       # verifies against the supplied key
+
+
+def test_dpop_rejects_symmetric_alg():
+    with pytest.raises(ColonyOIDCConfigError):
+        ColonyOIDCClient(CLIENT_ID, "secret", discovery=DISCOVERY, dpop=True, dpop_alg="HS256")
+
+
+def test_dpop_composes_with_private_key_jwt(keypair):
+    s = DpopSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, discovery=DISCOVERY, session=s,
+                         token_endpoint_auth_method="private_key_jwt",
+                         private_key=keypair, dpop=True)
+    c.fetch_token("c", "v")
+    assert "DPoP" in s.token_headers                                # sender-constraint proof
+    assert "client_assertion" in s.last_post["data"]               # AND private_key_jwt auth
+    assert s.last_post["auth"] is None
