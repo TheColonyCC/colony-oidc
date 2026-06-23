@@ -64,6 +64,14 @@ _CLIENT_ASSERTION_ALGS = (
 # accepted lifetime at 5 min, so stay well under it.
 _ASSERTION_LIFETIME = 60
 
+# DPoP (RFC 9449) — sender-constrained tokens. ES256 first: an EC P-256 proof
+# key is the compact, conventional default for DPoP.
+DPOP_ALGS = (
+    "ES256", "ES384", "ES512",
+    "RS256", "RS384", "RS512",
+    "PS256", "PS384", "PS512",
+)
+
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
@@ -94,6 +102,9 @@ class ColonyOIDCClient:
         private_key_id: str | None = None,
         signing_alg: str = "RS256",
         use_par: bool = False,
+        dpop: bool = False,
+        dpop_key: Any = None,
+        dpop_alg: str = "ES256",
         accept_subject: str = "any",
     ) -> None:
         if not client_id:
@@ -124,6 +135,7 @@ class ColonyOIDCClient:
         self.private_key_id = private_key_id
         self.signing_alg = signing_alg
         self.use_par = use_par
+        self._init_dpop(dpop, dpop_key, dpop_alg)
         if accept_subject not in ("any", "human", "agent"):
             raise ColonyOIDCConfigError(
                 "accept_subject must be 'any', 'human', or 'agent'")
@@ -325,15 +337,77 @@ class ColonyOIDCClient:
         headers = {"kid": self.private_key_id} if self.private_key_id else None
         return jwt.encode(claims, self.private_key, algorithm=self.signing_alg, headers=headers)
 
+    # ---- DPoP (RFC 9449): sender-constrained tokens ----
+
+    def _init_dpop(self, dpop: bool, dpop_key: Any, dpop_alg: str) -> None:
+        """Set up the DPoP proof key, if enabled. When ``dpop`` is true (or a
+        ``dpop_key`` is supplied) the client binds its tokens to a held key:
+        every token/refresh request carries a DPoP proof, and access tokens are
+        presented at the resource with the ``DPoP`` scheme. A fresh EC P-256 key
+        is generated when none is provided."""
+        self.dpop_enabled = bool(dpop or dpop_key is not None)
+        self._dpop_key: Any = None
+        self._dpop_alg = dpop_alg
+        self._dpop_jwk: dict[str, Any] | None = None
+        if not self.dpop_enabled:
+            return
+        if dpop_alg not in DPOP_ALGS:
+            raise ColonyOIDCConfigError("dpop_alg must be one of " + ", ".join(DPOP_ALGS))
+        key = dpop_key
+        if isinstance(key, (str, bytes)):
+            from cryptography.hazmat.primitives.serialization import load_pem_private_key
+            key = load_pem_private_key(key.encode() if isinstance(key, str) else key, password=None)
+        if key is None:
+            key = self._generate_dpop_key(dpop_alg)
+        self._dpop_key = key
+        from jwt.algorithms import ECAlgorithm, RSAAlgorithm
+        algcls = ECAlgorithm if dpop_alg.startswith("ES") else RSAAlgorithm
+        # The proof embeds ONLY the public JWK (the IdP rejects private params).
+        self._dpop_jwk = algcls.to_jwk(self._dpop_key.public_key(), as_dict=True)
+
+    @staticmethod
+    def _generate_dpop_key(alg: str) -> Any:
+        from cryptography.hazmat.primitives.asymmetric import ec, rsa
+        if alg.startswith("ES"):
+            curve: ec.EllipticCurve
+            if alg == "ES256":
+                curve = ec.SECP256R1()
+            elif alg == "ES384":
+                curve = ec.SECP384R1()
+            else:
+                curve = ec.SECP521R1()
+            return ec.generate_private_key(curve)
+        return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    def _dpop_proof(self, htm: str, htu: str, *, access_token: str | None = None) -> str:
+        """Build a DPoP proof JWT (RFC 9449) for an ``htm`` request to ``htu``.
+
+        Carries a fresh ``jti`` + ``iat`` and embeds the public proof key in the
+        ``jwk`` header. At a protected resource pass ``access_token`` so the
+        proof includes ``ath`` = base64url(sha256(token))."""
+        claims: dict[str, Any] = {
+            "jti": secrets.token_urlsafe(32), "htm": htm, "htu": htu,
+            "iat": int(time.time()),
+        }
+        if access_token is not None:
+            claims["ath"] = _b64url(hashlib.sha256(access_token.encode()).digest())
+        return jwt.encode(claims, self._dpop_key, algorithm=self._dpop_alg,
+                          headers={"typ": "dpop+jwt", "jwk": self._dpop_jwk})
+
     def _token_request(self, data: dict[str, Any]) -> dict[str, Any]:
         """POST the token endpoint with the configured client auth, mapping any failure to
         :class:`ColonyOIDCTokenError`. Shared by :meth:`fetch_token` and
         :meth:`refresh_token` so both speak identical client authentication (secret or
-        ``private_key_jwt``) and error handling."""
+        ``private_key_jwt``) and error handling. When DPoP is enabled a proof is
+        attached so the issued tokens are sender-constrained to the proof key."""
         auth = self._client_auth(data)
+        headers = {"Accept": "application/json"}
+        token_endpoint = self._endpoint("token_endpoint")
+        if self.dpop_enabled:
+            headers["DPoP"] = self._dpop_proof("POST", token_endpoint)
         try:
-            r = self._http.post(self._endpoint("token_endpoint"), data=data, auth=auth,
-                                 headers={"Accept": "application/json"}, timeout=self.timeout)
+            r = self._http.post(token_endpoint, data=data, auth=auth,
+                                 headers=headers, timeout=self.timeout)
         except requests.RequestException as e:
             raise ColonyOIDCTokenError(f"token request failed: {e}") from e
         if r.status_code != 200:
@@ -478,10 +552,20 @@ class ColonyOIDCClient:
     # ---- userinfo (optional) ----
 
     def fetch_userinfo(self, access_token: str) -> dict[str, Any]:
+        """Fetch the UserInfo claims for ``access_token``.
+
+        When DPoP is enabled the token is a sender-constrained one, so it is
+        presented with the ``DPoP`` auth scheme (RFC 9449 §7.1) plus a proof
+        carrying ``ath`` bound to this token; otherwise it is a plain Bearer."""
+        userinfo_endpoint = self._endpoint("userinfo_endpoint")
+        if self.dpop_enabled:
+            headers = {"Authorization": f"DPoP {access_token}",
+                       "DPoP": self._dpop_proof("GET", userinfo_endpoint, access_token=access_token),
+                       "Accept": "application/json"}
+        else:
+            headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
         try:
-            r = self._http.get(self._endpoint("userinfo_endpoint"),
-                               headers={"Authorization": f"Bearer {access_token}",
-                                        "Accept": "application/json"}, timeout=self.timeout)
+            r = self._http.get(userinfo_endpoint, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             return r.json()
         except requests.RequestException as e:
