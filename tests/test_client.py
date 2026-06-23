@@ -622,3 +622,152 @@ def test_unknown_kid_refetches_once_then_fails(keypair):
     with pytest.raises(ColonyOIDCVerificationError):
         c.verify_id_token(token, nonce="N")
     assert s.jwks_fetches == 2                            # cached miss forced one refetch
+
+
+# ---- private_key_jwt client authentication (RFC 7523) ----
+
+from urllib.parse import parse_qs, urlparse  # noqa: E402
+
+CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+TOKEN_ENDPOINT = f"{ISSUER}/oauth/token"
+
+
+def _decode_assertion(assertion, pubkey):
+    return jwt.decode(assertion, pubkey.public_key(), algorithms=["RS256"],
+                      audience=TOKEN_ENDPOINT)
+
+
+def _pkjwt_client(session, keypair, **kw):
+    return ColonyOIDCClient(CLIENT_ID, discovery=DISCOVERY, session=session,
+                            token_endpoint_auth_method="private_key_jwt",
+                            private_key=keypair, **kw)
+
+
+def test_private_key_jwt_token_request_sends_signed_assertion(keypair):
+    s = FakeSession(keypair)
+    c = _pkjwt_client(s, keypair, private_key_id="ck-1")
+    c.fetch_token("authcode", "verifier123")
+    data = s.last_post["data"]
+    # no HTTP Basic auth and no shared secret travels with an assertion
+    assert s.last_post["auth"] is None
+    assert "client_secret" not in data
+    assert data["client_assertion_type"] == CLIENT_ASSERTION_TYPE
+    header = jwt.get_unverified_header(data["client_assertion"])
+    assert header["alg"] == "RS256" and header["kid"] == "ck-1"
+    claims = _decode_assertion(data["client_assertion"], keypair)   # verifies signature + aud
+    assert claims["iss"] == CLIENT_ID and claims["sub"] == CLIENT_ID   # RFC 7523 §3
+    assert claims["aud"] == TOKEN_ENDPOINT
+    assert claims["jti"]
+    assert 0 < claims["exp"] - claims["iat"] <= 300                  # IdP caps lifetime at 5 min
+
+
+def test_private_key_jwt_refresh_also_signs(keypair):
+    s = FakeSession(keypair, token_payload={
+        "access_token": "at2", "token_type": "Bearer", "refresh_token": "rt2"})
+    c = _pkjwt_client(s, keypair)
+    c.refresh_token("rt1")
+    assert s.last_post["auth"] is None
+    assert "client_assertion" in s.last_post["data"]
+    assert s.last_post["data"]["grant_type"] == "refresh_token"
+
+
+def test_private_key_jwt_jti_is_unique_per_request(keypair):
+    s = FakeSession(keypair)
+    c = _pkjwt_client(s, keypair)
+    c.fetch_token("c", "v")
+    jti1 = _decode_assertion(s.last_post["data"]["client_assertion"], keypair)["jti"]
+    c.fetch_token("c", "v")
+    jti2 = _decode_assertion(s.last_post["data"]["client_assertion"], keypair)["jti"]
+    assert jti1 != jti2                                             # single-use, replay-safe
+
+
+def test_private_key_jwt_requires_a_key():
+    with pytest.raises(ColonyOIDCConfigError):
+        ColonyOIDCClient(CLIENT_ID, discovery=DISCOVERY,
+                         token_endpoint_auth_method="private_key_jwt")
+
+
+def test_private_key_jwt_rejects_symmetric_alg(keypair):
+    with pytest.raises(ColonyOIDCConfigError):
+        ColonyOIDCClient(CLIENT_ID, discovery=DISCOVERY,
+                         token_endpoint_auth_method="private_key_jwt",
+                         private_key=keypair, signing_alg="HS256")
+
+
+def test_secret_methods_still_require_a_secret():
+    with pytest.raises(ColonyOIDCConfigError):
+        ColonyOIDCClient(CLIENT_ID, discovery=DISCOVERY)            # default basic, no secret
+
+
+def test_unknown_auth_method_rejected():
+    with pytest.raises(ColonyOIDCConfigError):
+        ColonyOIDCClient(CLIENT_ID, "s", discovery=DISCOVERY,
+                         token_endpoint_auth_method="tls_client_auth")
+
+
+# ---- Pushed Authorization Requests (RFC 9126) ----
+
+DISCOVERY_PAR = {**DISCOVERY, "pushed_authorization_request_endpoint": f"{ISSUER}/oauth/par"}
+
+
+class ParSession(FakeSession):
+    """FakeSession that also answers ``POST /oauth/par`` with a request_uri."""
+    def __init__(self, key, *, request_uri="urn:ietf:params:oauth:request_uri:xyz",
+                 par_status=201, **kw):
+        super().__init__(key, **kw)
+        self.request_uri = request_uri
+        self.par_status = par_status
+        self.par_post = None
+
+    def post(self, url, data=None, auth=None, **kw):
+        if url.endswith("/oauth/par"):
+            self.par_post = {"url": url, "data": data, "auth": auth}
+            self.last_post = self.par_post
+            body = {"expires_in": 60}
+            if self.request_uri:
+                body["request_uri"] = self.request_uri
+            return FakeResp(body, self.par_status)
+        return super().post(url, data=data, auth=auth, **kw)
+
+
+def test_create_login_with_par_pushes_params_and_shortens_browser_url(keypair):
+    s = ParSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, "secret", REDIRECT, discovery=DISCOVERY_PAR, session=s)
+    login = c.create_login(use_par=True, scope="openid profile")
+    q = parse_qs(urlparse(login.authorization_url).query)
+    # the browser only sees client_id + the one-time request_uri
+    assert q["client_id"] == [CLIENT_ID]
+    assert q["request_uri"] == [s.request_uri]
+    assert "code_challenge" not in q and "redirect_uri" not in q
+    # the real parameters went to the PAR endpoint, with client auth
+    assert s.par_post["url"].endswith("/oauth/par")
+    assert s.par_post["data"]["code_challenge_method"] == "S256"
+    assert s.par_post["data"]["redirect_uri"] == REDIRECT
+    assert s.par_post["auth"] == (CLIENT_ID, "secret")             # client_secret_basic
+    assert login.code_verifier                                     # still returned for the exchange
+
+
+def test_par_uses_private_key_jwt_when_configured(keypair):
+    s = ParSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, discovery=DISCOVERY_PAR, session=s,
+                         redirect_uri=REDIRECT, use_par=True,
+                         token_endpoint_auth_method="private_key_jwt", private_key=keypair)
+    c.create_login(scope="openid")                                 # use_par defaults from client
+    assert s.par_post["auth"] is None
+    assert "client_assertion" in s.par_post["data"]
+
+
+def test_par_missing_request_uri_raises(keypair):
+    s = ParSession(keypair, request_uri="")
+    c = ColonyOIDCClient(CLIENT_ID, "secret", REDIRECT, discovery=DISCOVERY_PAR, session=s)
+    with pytest.raises(ColonyOIDCError):
+        c.create_login(use_par=True)
+
+
+def test_no_par_when_not_requested(keypair):
+    s = ParSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, "secret", REDIRECT, discovery=DISCOVERY_PAR, session=s)
+    login = c.create_login()                                       # use_par defaults False
+    q = parse_qs(urlparse(login.authorization_url).query)
+    assert "code_challenge" in q and "request_uri" not in q
+    assert s.par_post is None                                      # PAR endpoint untouched
