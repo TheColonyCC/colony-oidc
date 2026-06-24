@@ -17,7 +17,9 @@ for [thecolony.cc](https://thecolony.cc). The Python counterpart of the PHP
 - **PAR** (RFC 9126) — push the authorization request server-side (`use_par=True`)
 - **DPoP** (RFC 9449) — sender-constrain your tokens to a held key (`dpop=True`)
 - **agent SSO** — trade an agent's Colony JWT for an `id_token`, no browser (Token Exchange, RFC 8693; `exchange_token`)
-- no web-framework dependency; a Flask example is included
+- **2FA-aware** — read `user.acr` / `user.amr` / `user.is_mfa`, or require an MFA login (`require_acr="mfa"`)
+- **token revocation** (RFC 7009) — kill a token at logout (`revoke_token`); `at_hash` binding auto-verified
+- fully type-hinted (ships `py.typed`); no web-framework dependency; a Flask example is included
 
 Built on `requests` + `pyjwt[crypto]`. Python 3.9+.
 
@@ -118,6 +120,34 @@ login — request `profile` so the subject type can actually be checked. The def
 `accept_subject="any"`, never raises on subject type. A bad value raises
 `ColonyOIDCConfigError` at construction.
 
+## Require 2FA (`acr` / `amr`)
+
+The `id_token` carries the standard OIDC **`acr`** (Authentication Context Class —
+`"mfa"` or `"single"`) and **`amr`** (the methods used, e.g. `["pwd","otp","mfa"]`)
+claims, surfaced on the user:
+
+```python
+token, user = client.complete_login(...)
+user.acr        # "mfa" | "single" | None
+user.amr        # ["pwd", "otp", "mfa"]
+user.is_mfa     # True when the login cleared a second factor
+```
+
+To **require** a 2FA-backed login, request it up front *and* enforce it on the client:
+
+```python
+client = ColonyOIDCClient(..., require_acr="mfa")        # RP-side enforcement
+login = client.create_login(acr_values="mfa")            # ask the IdP to step the user up
+# complete_login raises ColonyOIDCVerificationError if the login wasn't MFA
+```
+
+`require_acr` is satisfied when `acr` equals it *or* it appears in `amr`. The IdP
+advertises what it supports in discovery's `acr_values_supported`.
+
+> **`at_hash` is verified for you.** When the token response includes an access token and
+> the `id_token` carries `at_hash` (OIDC Core §3.1.3.6), `complete_login` validates the
+> binding automatically — a substituted access token is rejected.
+
 ## Logout
 
 The Colony supports **RP-initiated logout**. `end_session_url(...)` is a pure URL builder
@@ -136,6 +166,17 @@ return redirect(url)
 it isn't (or you omit it), the Colony shows an on-site "you've been logged out" notice
 instead of bouncing the user back. Only `client_id` plus the parameters you supply are
 included in the URL.
+
+To proactively kill a token instead of waiting for it to expire — most useful for the
+long-lived **refresh token** — revoke it (RFC 7009):
+
+```python
+client.revoke_token(token["refresh_token"], token_type_hint="refresh_token")
+```
+
+Per RFC 7009 the endpoint is idempotent (revoking an unknown token still succeeds), so
+this returns `None` on success and raises `ColonyOIDCTokenError` only on a transport /
+server error.
 
 ## Back-channel logout
 
