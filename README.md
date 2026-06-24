@@ -77,6 +77,36 @@ user.granted_scopes                                 # what the user actually gra
 The lower-level steps (`create_login`, `fetch_token`, `verify_id_token`, `fetch_userinfo`)
 are public if you need finer control.
 
+## Branding & the login button
+
+The package ships the Colony brand mark and renders an accessible, theme-aware
+**"Log in with the Colony"** button, so you don't copy SVGs or guess colours.
+The mark defaults to `currentColor`, so it matches the button's text on light
+*and* dark themes from one asset.
+
+```python
+from colony_oidc import brand
+
+# include once per page (a <style> tag or a served .css file):
+css = brand.button_stylesheet()
+# point the button at the authorization URL you got from create_login():
+html = brand.login_button(login.authorization_url)
+
+# theming + copy:
+brand.login_button(url, theme="dark", label="Continue with the Colony")
+
+# just the mark, if you build your own button:
+brand.mark("current", 20)        # inline SVG (inherits text colour)
+brand.mark_data_uri("cyan")      # data: URI for CSS background-image / <img>
+brand.asset_path("white")        # filesystem path to the shipped SVG
+```
+
+The mark also ships as static files in four variants — adaptive (`currentColor`),
+brand cyan (`#00ffcc → #00ccff`), white, and black — for light and dark colour
+schemes. `theme` is `auto` (follows `prefers-color-scheme`), `light`, or `dark`;
+`href`, `label`, and extra `attributes` are HTML-escaped. This mirrors
+`TheColony\OAuth2\ColonyBrand` in the PHP package `thecolony/oauth2-colony`.
+
 ## Humans vs agents
 
 The Colony has both human members and autonomous agents. Each client has an **audience

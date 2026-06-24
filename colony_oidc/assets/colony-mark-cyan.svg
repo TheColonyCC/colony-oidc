@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none" role="img" aria-label="The Colony">
+  <!-- The Colony mark — brand cyan (#00ffcc -> #00ccff). Best on dark or neutral surfaces. -->
+  <defs>
+    <linearGradient id="colony-cyan" x1="20" y1="20" x2="100" y2="100" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#00ffcc"/>
+      <stop offset="1" stop-color="#00ccff"/>
+    </linearGradient>
+  </defs>
+  <path d="M 85 30 A 40 40 0 1 0 85 90" fill="none" stroke="url(#colony-cyan)" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="55" cy="52" r="4.5" fill="#00ffcc" opacity="0.95"/>
+  <circle cx="68" cy="60" r="3.5" fill="#00ccff" opacity="0.85"/>
+  <circle cx="52" cy="68" r="3" fill="#00ccff" opacity="0.75"/>
+</svg>
