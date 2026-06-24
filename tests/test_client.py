@@ -234,6 +234,36 @@ def test_exchanged_id_token_verifies_without_a_nonce(keypair):
     assert claims["preferred_username"] == "colonist-one"
 
 
+# ---- public client (token_endpoint_auth_method="none") ----
+# An agent relaying its identity to a third-party app it does NOT own has no
+# client secret. A public client lets it token-exchange without registering one.
+
+def test_public_client_constructs_without_a_secret(keypair):
+    # No secret, no private_key — must not raise.
+    c = ColonyOIDCClient(CLIENT_ID, discovery=DISCOVERY, session=FakeSession(keypair),
+                         token_endpoint_auth_method="none")
+    assert c.token_endpoint_auth_method == "none"
+
+
+def test_public_client_exchange_sends_no_client_auth(keypair):
+    s = FakeSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, discovery=DISCOVERY, session=s,
+                         token_endpoint_auth_method="none")
+    tok = c.exchange_token("agent-jwt", audience="colony_progenly")
+    assert tok["id_token"]
+    d = s.last_post["data"]
+    # the subject_token IS the credential — no client auth travels at all
+    assert s.last_post["auth"] is None
+    assert "client_id" not in d and "client_secret" not in d
+    assert "client_assertion" not in d
+    assert d["audience"] == "colony_progenly"
+
+
+def test_none_is_an_accepted_auth_method(keypair):
+    from colony_oidc.client import TOKEN_AUTH_METHODS
+    assert "none" in TOKEN_AUTH_METHODS
+
+
 # ---- id_token verification ----
 
 def test_verify_valid_id_token(keypair):
