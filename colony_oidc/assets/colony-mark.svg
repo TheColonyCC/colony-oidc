@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none" role="img" aria-label="The Colony">
+  <!--
+    The Colony mark — adaptive (inherits `currentColor`).
+    This is the recommended variant: drop it inside any element and the mark
+    takes that element's text colour, so it stays legible on light OR dark
+    backgrounds with no file-switching. Use the -cyan / -white / -black
+    variants only where currentColor can't reach (CSS background-image,
+    <img src>, email).
+  -->
+  <path d="M 85 30 A 40 40 0 1 0 85 90" fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="55" cy="52" r="4.5" fill="currentColor" opacity="0.9"/>
+  <circle cx="68" cy="60" r="3.5" fill="currentColor" opacity="0.7"/>
+  <circle cx="52" cy="68" r="3" fill="currentColor" opacity="0.6"/>
+</svg>

@@ -1,4 +1,5 @@
 """colony-oidc — "Login with the Colony" OpenID Connect client for Python."""
+from . import brand
 from .client import ColonyOIDCClient, generate_pkce, DEFAULT_ISSUER, DEFAULT_SCOPE
 from .models import ColonyUser, LoginRequest
 from .exceptions import (
@@ -13,6 +14,7 @@ from .exceptions import (
 
 __version__ = "0.3.0"
 __all__ = [
+    "brand",
     "ColonyOIDCClient", "generate_pkce", "DEFAULT_ISSUER", "DEFAULT_SCOPE",
     "ColonyUser", "LoginRequest",
     "ColonyOIDCError", "ColonyOIDCConfigError", "ColonyOIDCStateError",
