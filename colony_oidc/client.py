@@ -153,8 +153,10 @@ class ColonyOIDCClient:
                 "accept_subject must be 'any', 'human', or 'agent'")
         self.accept_subject = accept_subject
         # When set, complete_login requires the login's acr/amr to satisfy this
-        # Authentication Context Class (e.g. "mfa" → a 2FA-backed login). Pass
-        # acr_values=<value> on create_login so the IdP enforces it up front too.
+        # Authentication Context Class (e.g. "mfa" → a 2FA-backed login).
+        # create_login also sends it as acr_values automatically, so the IdP
+        # enforces it up front (prompting a step-up) rather than the RP only
+        # rejecting a weaker login after the fact.
         self.require_acr = require_acr
         self._http = session or requests.Session()
         self._discovery = discovery
@@ -194,12 +196,17 @@ class ColonyOIDCClient:
         nonce: str | None = None,
         code_verifier: str | None = None,
         prompt: str | None = None,
+        max_age: int | None = None,
+        login_hint: str | None = None,
+        acr_values: str | None = None,
         use_par: bool | None = None,
         **extra: str,
     ) -> LoginRequest:
         redirect = redirect_uri or self.redirect_uri
         if not redirect:
             raise ColonyOIDCConfigError("redirect_uri must be set on the client or passed in")
+        if max_age is not None and max_age < 0:
+            raise ColonyOIDCConfigError("max_age must be a non-negative number of seconds")
         state = state or secrets.token_urlsafe(24)
         nonce = nonce or secrets.token_urlsafe(24)
         verifier = code_verifier or generate_pkce()[0]
@@ -216,6 +223,17 @@ class ColonyOIDCClient:
         }
         if prompt:
             params["prompt"] = prompt
+        if max_age is not None:
+            params["max_age"] = str(max_age)
+        if login_hint:
+            params["login_hint"] = login_hint
+        # acr_values: an explicit argument wins; otherwise fall back to the
+        # client's configured ``require_acr`` so the IdP enforces the
+        # authentication-context up front (e.g. prompts a 2FA step-up).
+        # ``complete_login`` still re-checks acr server-side as defence in depth.
+        effective_acr = acr_values if acr_values is not None else self.require_acr
+        if effective_acr:
+            params["acr_values"] = effective_acr
         params.update(extra)
         authorization_endpoint = self._endpoint("authorization_endpoint")
         if self.use_par if use_par is None else use_par:

@@ -161,6 +161,57 @@ def test_create_login_builds_correct_url(keypair):
     assert q["code_challenge"][0] == _b64url(hashlib.sha256(login.code_verifier.encode()).digest())
 
 
+def _login_query(login):
+    from urllib.parse import urlparse, parse_qs
+    return parse_qs(urlparse(login.authorization_url).query)
+
+
+def test_create_login_sends_max_age_and_login_hint(keypair):
+    c = make_client(FakeSession(keypair))
+    q = _login_query(c.create_login(max_age=3600, login_hint="colonist-one"))
+    assert q["max_age"] == ["3600"]
+    assert q["login_hint"] == ["colonist-one"]
+
+
+def test_create_login_omits_max_age_login_hint_when_absent(keypair):
+    c = make_client(FakeSession(keypair))
+    q = _login_query(c.create_login())
+    assert "max_age" not in q and "login_hint" not in q and "acr_values" not in q
+
+
+def test_create_login_negative_max_age_raises(keypair):
+    c = make_client(FakeSession(keypair))
+    with pytest.raises(ColonyOIDCConfigError):
+        c.create_login(max_age=-1)
+
+
+def test_create_login_sends_explicit_acr_values(keypair):
+    c = make_client(FakeSession(keypair))
+    q = _login_query(c.create_login(acr_values="mfa"))
+    assert q["acr_values"] == ["mfa"]
+
+
+def test_create_login_auto_sends_acr_values_from_require_acr(keypair):
+    # A require_acr="mfa" client asks the IdP to enforce MFA up front
+    # (step-up), not just reject a weaker login after the fact.
+    c = make_client(FakeSession(keypair), require_acr="mfa")
+    q = _login_query(c.create_login())
+    assert q["acr_values"] == ["mfa"]
+
+
+def test_explicit_acr_values_overrides_require_acr(keypair):
+    c = make_client(FakeSession(keypair), require_acr="mfa")
+    q = _login_query(c.create_login(acr_values="single"))
+    assert q["acr_values"] == ["single"]
+
+
+def test_colony_user_surfaces_sid_and_auth_time():
+    u = ColonyUser.from_claims({
+        "sub": "agent_9", "sid": "sess_42", "auth_time": 1_700_000_000})
+    assert u.sid == "sess_42"
+    assert u.auth_time == 1_700_000_000
+
+
 # ---- token exchange ----
 
 def test_fetch_token_posts_code_and_pkce(keypair):

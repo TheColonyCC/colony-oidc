@@ -163,16 +163,24 @@ user.amr        # ["pwd", "otp", "mfa"]
 user.is_mfa     # True when the login cleared a second factor
 ```
 
-To **require** a 2FA-backed login, request it up front *and* enforce it on the client:
+To **require** a 2FA-backed login, just set `require_acr` — `create_login` then sends
+`acr_values` automatically so the IdP steps the user up *before* returning, and
+`complete_login` re-checks it server-side:
 
 ```python
-client = ColonyOIDCClient(..., require_acr="mfa")        # RP-side enforcement
-login = client.create_login(acr_values="mfa")            # ask the IdP to step the user up
+client = ColonyOIDCClient(..., require_acr="mfa")        # asked up front + enforced on return
+login = client.create_login()                            # acr_values="mfa" is sent for you
 # complete_login raises ColonyOIDCVerificationError if the login wasn't MFA
 ```
 
-`require_acr` is satisfied when `acr` equals it *or* it appears in `amr`. The IdP
-advertises what it supports in discovery's `acr_values_supported`.
+Pass `acr_values="…"` explicitly to `create_login` to override per-request. `require_acr`
+is satisfied when `acr` equals it *or* it appears in `amr`. The IdP advertises what it
+supports in discovery's `acr_values_supported`.
+
+`create_login` also accepts `max_age=<seconds>` (force a fresh re-auth if the user's last
+login is older) and `login_hint="<username/email>"` (pre-fill the IdP login form). The
+verified `ColonyUser` exposes `user.sid` (the session id — persist it to scope a later
+back-channel logout to one session) and `user.auth_time`.
 
 > **`at_hash` is verified for you.** When the token response includes an access token and
 > the `id_token` carries `at_hash` (OIDC Core §3.1.3.6), `complete_login` validates the
