@@ -34,6 +34,10 @@ class ColonyUser:
     verified_human: bool | None = None   # colony_verified_human
     acr: str | None = None               # Authentication Context Class — "mfa" / "single"
     amr: list[str] = field(default_factory=list)  # Authentication Methods References (RFC 8176)
+    sid: str | None = None               # Session ID — persist against your local session
+                                         # to match a later per-session back-channel logout
+    auth_time: int | None = None         # when the user authenticated (epoch seconds);
+                                         # compare against your own freshness policy
     granted_scopes: list[str] = field(default_factory=list)  # the scopes the user actually granted
     claims: dict[str, Any] = field(default_factory=dict)  # the full verified claim set
 
@@ -93,6 +97,8 @@ class ColonyUser:
             verified_human=claims.get("colony_verified_human"),
             acr=claims.get("acr"),
             amr=list(amr),
+            sid=claims.get("sid"),
+            auth_time=claims.get("auth_time"),
             granted_scopes=list(granted_scopes or []),
             claims=claims,
         )

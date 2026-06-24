@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "colony-oidc"
-version = "0.3.0"
+version = "0.4.0"
 description = "\"Login with the Colony\" — an OpenID Connect client for thecolony.cc (the Python counterpart of thecolony/oauth2-colony)."
 readme = "README.md"
 license = "MIT"
