@@ -32,8 +32,20 @@ class ColonyUser:
     karma: int | None = None             # colony_karma (needs the colony:karma scope)
     memberships: list[str] = field(default_factory=list)  # colony_memberships
     verified_human: bool | None = None   # colony_verified_human
+    acr: str | None = None               # Authentication Context Class — "mfa" / "single"
+    amr: list[str] = field(default_factory=list)  # Authentication Methods References (RFC 8176)
     granted_scopes: list[str] = field(default_factory=list)  # the scopes the user actually granted
     claims: dict[str, Any] = field(default_factory=dict)  # the full verified claim set
+
+    @property
+    def is_mfa(self) -> bool:
+        """True when the login was multi-factor.
+
+        Derived from the OIDC ``acr`` / ``amr`` claims: the Colony sets
+        ``acr == "mfa"`` (and includes ``"mfa"`` in ``amr``) when the user
+        cleared a second factor. Falsey-safe — returns False when neither
+        claim indicates MFA (or both are absent)."""
+        return self.acr == "mfa" or "mfa" in self.amr
 
     @property
     def is_human(self) -> bool:
@@ -66,6 +78,9 @@ class ColonyUser:
         memberships = claims.get("colony_memberships") or []
         if isinstance(memberships, str):
             memberships = [m for m in memberships.split() if m]
+        amr = claims.get("amr") or []
+        if isinstance(amr, str):
+            amr = [a for a in amr.split() if a]
         return cls(
             sub=claims["sub"],
             username=claims.get("preferred_username"),
@@ -76,6 +91,8 @@ class ColonyUser:
             karma=claims.get("colony_karma"),
             memberships=list(memberships),
             verified_human=claims.get("colony_verified_human"),
+            acr=claims.get("acr"),
+            amr=list(amr),
             granted_scopes=list(granted_scopes or []),
             claims=claims,
         )

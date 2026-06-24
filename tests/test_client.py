@@ -30,6 +30,7 @@ DISCOVERY = {
     "userinfo_endpoint": f"{ISSUER}/oauth/userinfo",
     "jwks_uri": f"{ISSUER}/.well-known/jwks.json",
     "end_session_endpoint": f"{ISSUER}/oauth/logout",
+    "revocation_endpoint": f"{ISSUER}/oauth/revoke",
 }
 
 
@@ -124,6 +125,8 @@ class FakeSession:
                 "access_token": "at_abc", "token_type": "Bearer",
                 "id_token": make_id_token(self.key)}
             return FakeResp(payload, self.token_status)
+        if url.endswith("/oauth/revoke"):
+            return FakeResp({}, getattr(self, "revoke_status", 200))
         raise AssertionError(f"unexpected POST {url}")
 
 
@@ -948,3 +951,109 @@ def test_dpop_composes_with_private_key_jwt(keypair):
     assert "DPoP" in s.token_headers                                # sender-constraint proof
     assert "client_assertion" in s.last_post["data"]               # AND private_key_jwt auth
     assert s.last_post["auth"] is None
+
+
+# ---- acr / amr (2FA-aware logins) ----
+
+def _flow_token(key, **id_claims):
+    """A token-endpoint payload whose id_token carries the given extra claims."""
+    return {"access_token": "at_abc", "token_type": "Bearer",
+            "id_token": make_id_token(key, **id_claims)}
+
+
+def test_acr_amr_surface_on_user(keypair):
+    s = FakeSession(keypair, token_payload=_flow_token(
+        keypair, acr="mfa", amr=["pwd", "otp", "mfa"]))
+    c = make_client(s)
+    _, user = c.complete_login(code="x", code_verifier="v", nonce="N")
+    assert user.acr == "mfa"
+    assert user.amr == ["pwd", "otp", "mfa"]
+    assert user.is_mfa is True
+
+
+def test_single_factor_login_is_not_mfa(keypair):
+    s = FakeSession(keypair, token_payload=_flow_token(keypair, acr="single", amr=["pwd"]))
+    c = make_client(s)
+    _, user = c.complete_login(code="x", code_verifier="v", nonce="N")
+    assert user.is_mfa is False
+
+
+def test_require_acr_mfa_passes_when_mfa(keypair):
+    s = FakeSession(keypair, token_payload=_flow_token(keypair, acr="mfa", amr=["mfa"]))
+    c = make_client(s, require_acr="mfa")
+    _, user = c.complete_login(code="x", code_verifier="v", nonce="N")
+    assert user.is_mfa
+
+
+def test_require_acr_mfa_rejects_single_factor(keypair):
+    s = FakeSession(keypair, token_payload=_flow_token(keypair, acr="single", amr=["pwd"]))
+    c = make_client(s, require_acr="mfa")
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.complete_login(code="x", code_verifier="v", nonce="N")
+
+
+# ---- at_hash binding (OIDC Core §3.1.3.6) ----
+
+def _at_hash(access_token):
+    d = hashlib.sha256(access_token.encode("ascii")).digest()
+    return _b64url(d[:len(d) // 2])
+
+
+def test_complete_login_accepts_matching_at_hash(keypair):
+    s = FakeSession(keypair, token_payload=_flow_token(keypair, at_hash=_at_hash("at_abc")))
+    c = make_client(s)
+    token, user = c.complete_login(code="x", code_verifier="v", nonce="N")
+    assert token["access_token"] == "at_abc" and user.sub == "agent_123"
+
+
+def test_complete_login_rejects_mismatched_at_hash(keypair):
+    s = FakeSession(keypair, token_payload=_flow_token(keypair, at_hash=_at_hash("WRONG")))
+    c = make_client(s)
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.complete_login(code="x", code_verifier="v", nonce="N")
+
+
+def test_verify_id_token_skips_at_hash_when_absent(keypair):
+    # No at_hash claim → nothing to check, even with an access_token in hand.
+    c = make_client(FakeSession(keypair))
+    claims = c.verify_id_token(make_id_token(keypair, nonce="N"), nonce="N",
+                               access_token="anything")
+    assert claims["sub"] == "agent_123"
+
+
+# ---- token revocation (RFC 7009) ----
+
+def test_revoke_token_posts_with_hint_and_client_auth(keypair):
+    s = FakeSession(keypair)
+    c = make_client(s)
+    assert c.revoke_token("rt_123", token_type_hint="refresh_token") is None
+    assert s.last_post["url"].endswith("/oauth/revoke")
+    assert s.last_post["data"]["token"] == "rt_123"
+    assert s.last_post["data"]["token_type_hint"] == "refresh_token"
+    assert s.last_post["auth"] == (CLIENT_ID, "secret")
+
+
+def test_revoke_token_public_client_sends_no_auth(keypair):
+    s = FakeSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, discovery=DISCOVERY, session=s,
+                         token_endpoint_auth_method="none")
+    c.revoke_token("rt_123")
+    assert s.last_post["auth"] is None
+    assert "token_type_hint" not in s.last_post["data"]
+
+
+def test_revoke_token_raises_on_error_status(keypair):
+    s = FakeSession(keypair)
+    s.revoke_status = 503
+    c = make_client(s)
+    with pytest.raises(ColonyOIDCTokenError):
+        c.revoke_token("rt_123")
+
+
+# ---- py.typed (PEP 561) ----
+
+def test_package_ships_py_typed():
+    import os
+    import colony_oidc
+    marker = os.path.join(os.path.dirname(colony_oidc.__file__), "py.typed")
+    assert os.path.exists(marker), "colony_oidc must ship a py.typed marker (PEP 561)"

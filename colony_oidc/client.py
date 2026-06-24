@@ -111,6 +111,7 @@ class ColonyOIDCClient:
         dpop_key: Any = None,
         dpop_alg: str = "ES256",
         accept_subject: str = "any",
+        require_acr: str | None = None,
     ) -> None:
         if not client_id:
             raise ColonyOIDCConfigError("client_id is required")
@@ -151,6 +152,10 @@ class ColonyOIDCClient:
             raise ColonyOIDCConfigError(
                 "accept_subject must be 'any', 'human', or 'agent'")
         self.accept_subject = accept_subject
+        # When set, complete_login requires the login's acr/amr to satisfy this
+        # Authentication Context Class (e.g. "mfa" → a 2FA-backed login). Pass
+        # acr_values=<value> on create_login so the IdP enforces it up front too.
+        self.require_acr = require_acr
         self._http = session or requests.Session()
         self._discovery = discovery
         self._jwks_cache: dict[str, Any] | None = None
@@ -516,7 +521,10 @@ class ColonyOIDCClient:
             raise ColonyOIDCVerificationError(f"no JWKS key matches id_token kid={kid!r}")
         return RSAAlgorithm.from_jwk(json.dumps(jwk))
 
-    def verify_id_token(self, id_token: str, *, nonce: str | None = None) -> dict[str, Any]:
+    def verify_id_token(
+        self, id_token: str, *, nonce: str | None = None,
+        access_token: str | None = None,
+    ) -> dict[str, Any]:
         try:
             header = jwt.get_unverified_header(id_token)
         except jwt.PyJWTError as e:
@@ -532,6 +540,16 @@ class ColonyOIDCClient:
             raise ColonyOIDCVerificationError(f"id_token verification failed: {e}") from e
         if nonce is not None and claims.get("nonce") != nonce:
             raise ColonyOIDCVerificationError("id_token nonce mismatch (possible replay)")
+        # OIDC Core §3.1.3.6: when an access_token is supplied AND the id_token
+        # carries at_hash, the RP MUST validate the binding. at_hash is the
+        # base64url (no pad) of the left-most half of SHA-256(access_token) —
+        # the hash matching the id_token's RS256/SHA-256 signature.
+        if access_token is not None and "at_hash" in claims:
+            digest = hashlib.sha256(access_token.encode("ascii")).digest()
+            expected = _b64url(digest[: len(digest) // 2])
+            if not secrets.compare_digest(str(claims["at_hash"]), expected):
+                raise ColonyOIDCVerificationError(
+                    "id_token at_hash does not match the access_token (token substitution?)")
         return claims
 
     # ---- back-channel logout ----
@@ -616,6 +634,35 @@ class ColonyOIDCClient:
         except requests.RequestException as e:
             raise ColonyOIDCTokenError(f"userinfo request failed: {e}") from e
 
+    # ---- token revocation (RFC 7009) ----
+
+    def revoke_token(self, token: str, *, token_type_hint: str | None = None) -> None:
+        """Revoke an access or refresh token at the IdP (RFC 7009).
+
+        Call this on local logout to proactively kill the token server-side instead of
+        waiting for it to expire — most useful for the **refresh token**, which otherwise
+        lives for its full rotating lifetime. Pass ``token_type_hint`` (``"refresh_token"``
+        or ``"access_token"``) to help the IdP look it up. Authenticated with the same
+        client credential as the token endpoint (none for a public client).
+
+        Per RFC 7009 the endpoint returns 200 even for an unknown/already-invalid token, so
+        a successful call is idempotent and returns ``None``. Raises
+        :class:`ColonyOIDCTokenError` on a transport or non-2xx error, and
+        :class:`ColonyOIDCConfigError` if the IdP doesn't advertise a revocation endpoint."""
+        endpoint = self._endpoint("revocation_endpoint")
+        data: dict[str, Any] = {"token": token}
+        if token_type_hint:
+            data["token_type_hint"] = token_type_hint
+        auth = self._client_auth(data)
+        try:
+            r = self._http.post(endpoint, data=data, auth=auth,
+                                 headers={"Accept": "application/json"}, timeout=self.timeout)
+        except requests.RequestException as e:
+            raise ColonyOIDCTokenError(f"revocation request failed: {e}") from e
+        if r.status_code not in (200, 204):
+            raise ColonyOIDCTokenError(
+                f"revocation endpoint returned {r.status_code}: {r.text[:200]}")
+
     # ---- RP-initiated logout ----
 
     def end_session_url(
@@ -666,7 +713,9 @@ class ColonyOIDCClient:
         id_token = token.get("id_token")
         if not id_token:
             raise ColonyOIDCTokenError("token response had no id_token (is 'openid' in scope?)")
-        claims = self.verify_id_token(id_token, nonce=nonce)
+        # Pass the access_token so verify_id_token validates at_hash when present.
+        claims = self.verify_id_token(id_token, nonce=nonce,
+                                      access_token=token.get("access_token"))
         if fetch_userinfo:
             claims = {**claims, **self.fetch_userinfo(token["access_token"])}
         # Under granular consent the user may grant fewer scopes than requested; the token
@@ -674,7 +723,24 @@ class ColonyOIDCClient:
         granted_scopes = [s for s in str(token.get("scope", "")).split() if s]
         user = ColonyUser.from_claims(claims, granted_scopes=granted_scopes)
         self._enforce_accept_subject(user)
+        self._enforce_acr(user)
         return token, user
+
+    def _enforce_acr(self, user: ColonyUser) -> None:
+        """RP-side enforcement of the configured ``require_acr`` (e.g. "mfa").
+
+        Complements requesting ``acr_values`` on the authorization request: even if
+        the IdP somehow returned a weaker login, the RP refuses it here. Satisfied when
+        the login's ``acr`` equals the requirement OR the requirement appears in ``amr``
+        (so ``require_acr="mfa"`` accepts either signal). Raises
+        :class:`ColonyOIDCVerificationError` otherwise."""
+        if self.require_acr is None:
+            return
+        if user.acr == self.require_acr or self.require_acr in user.amr:
+            return
+        raise ColonyOIDCVerificationError(
+            f"this client requires acr={self.require_acr!r} but the login presented "
+            f"acr={user.acr!r} / amr={user.amr!r}")
 
     def _enforce_accept_subject(self, user: ColonyUser) -> None:
         """RP-side defense-in-depth for the configured ``accept_subject`` restriction.
