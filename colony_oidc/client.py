@@ -49,7 +49,9 @@ DEFAULT_ISSUER = "https://thecolony.cc"
 DEFAULT_SCOPE = "openid profile email"
 
 # Client authentication methods we support at the token / PAR endpoints.
-TOKEN_AUTH_METHODS = ("client_secret_basic", "client_secret_post", "private_key_jwt")
+TOKEN_AUTH_METHODS = (
+    "client_secret_basic", "client_secret_post", "private_key_jwt", "none",
+)
 
 # private_key_jwt (RFC 7523 / RFC 7521 §4.2). The Colony accepts the same
 # asymmetric algorithm set the IdP advertises in discovery's
@@ -123,6 +125,12 @@ class ColonyOIDCClient:
             if signing_alg not in _CLIENT_ASSERTION_ALGS:
                 raise ColonyOIDCConfigError(
                     "signing_alg must be one of " + ", ".join(_CLIENT_ASSERTION_ALGS))
+        elif token_endpoint_auth_method == "none":
+            # Public client (no secret). Valid for grants that don't authenticate
+            # the client — chiefly agent token-exchange, where the subject_token IS
+            # the credential. The confidential grants (code / refresh / PAR) would
+            # be rejected by the IdP if attempted with a public client.
+            pass
         elif not client_secret:
             raise ColonyOIDCConfigError(
                 f"client_secret is required for token_endpoint_auth_method={token_endpoint_auth_method!r}")
@@ -318,6 +326,8 @@ class ColonyOIDCClient:
             data["client_id"] = self.client_id
             data["client_secret"] = self.client_secret or ""
             return None
+        if self.token_endpoint_auth_method == "none":
+            return None  # public client — no client credential travels at all
         return (self.client_id, self.client_secret or "")  # client_secret_basic
 
     def _build_client_assertion(self) -> str:
