@@ -11,7 +11,7 @@ from .exceptions import (
     ColonyOIDCVerificationError,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 __all__ = [
     "ColonyOIDCClient", "generate_pkce", "DEFAULT_ISSUER", "DEFAULT_SCOPE",
     "ColonyUser", "LoginRequest",
