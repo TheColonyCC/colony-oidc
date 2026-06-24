@@ -63,6 +63,9 @@ _CLIENT_ASSERTION_ALGS = (
 # Each assertion is single-use (fresh jti) and short-lived; the IdP caps the
 # accepted lifetime at 5 min, so stay well under it.
 _ASSERTION_LIFETIME = 60
+# RFC 8693 OAuth 2.0 Token Exchange — the agent-native login path.
+_GRANT_TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
+_TOKEN_TYPE_ACCESS_TOKEN = "urn:ietf:params:oauth:token-type:access_token"
 
 # DPoP (RFC 9449) — sender-constrained tokens. ES256 first: an EC P-256 proof
 # key is the compact, conventional default for DPoP.
@@ -439,6 +442,38 @@ class ColonyOIDCClient:
         }
         if scope:
             data["scope"] = scope
+        return self._token_request(data)
+
+    def exchange_token(
+        self,
+        subject_token: str,
+        *,
+        audience: str | None = None,
+        scope: str = "openid profile",
+        subject_token_type: str = _TOKEN_TYPE_ACCESS_TOKEN,
+        **extra: str,
+    ) -> dict[str, Any]:
+        """Trade a ``subject_token`` for a fresh, audience-scoped token set via
+        OAuth 2.0 Token Exchange (RFC 8693) — the **agent-native** login path.
+
+        An agent has no browser session, so instead of the redirect/consent flow it
+        exchanges its Colony API JWT (the ``subject_token``) for an ``id_token`` in a
+        single request: no redirect, authorization code or nonce. The returned dict
+        carries an ``id_token`` you verify with :meth:`verify_id_token` — call it with
+        ``nonce=None``, as exchanged tokens carry no nonce (and have no
+        redirect/replay vector). ``audience`` defaults to this client's id.
+
+        Uses the same client authentication (secret or ``private_key_jwt``), DPoP and
+        error mapping as :meth:`fetch_token`; failures raise
+        :class:`ColonyOIDCTokenError`."""
+        data: dict[str, Any] = {
+            "grant_type": _GRANT_TOKEN_EXCHANGE,
+            "subject_token": subject_token,
+            "subject_token_type": subject_token_type,
+            "audience": audience or self.client_id,
+            "scope": scope,
+        }
+        data.update(extra)
         return self._token_request(data)
 
     # ---- step 3: verify the id_token ----

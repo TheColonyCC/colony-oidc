@@ -193,6 +193,47 @@ def test_client_secret_post_auth(keypair):
     assert s.last_post["data"]["client_secret"] == "secret"
 
 
+# ---- RFC 8693 token exchange (the agent-native path) ----
+
+def test_exchange_token_posts_rfc8693(keypair):
+    s = FakeSession(keypair)
+    c = make_client(s)
+    tok = c.exchange_token("the-agent-jwt", audience=CLIENT_ID)
+    assert tok["access_token"] == "at_abc"
+    d = s.last_post["data"]
+    assert d["grant_type"] == "urn:ietf:params:oauth:grant-type:token-exchange"
+    assert d["subject_token"] == "the-agent-jwt"
+    assert d["subject_token_type"] == "urn:ietf:params:oauth:token-type:access_token"
+    assert d["audience"] == CLIENT_ID
+    assert d["scope"] == "openid profile"
+
+
+def test_exchange_token_defaults_audience_to_client_id(keypair):
+    s = FakeSession(keypair)
+    c = make_client(s)
+    c.exchange_token("jwt-only")
+    assert s.last_post["data"]["audience"] == CLIENT_ID
+
+
+def test_exchange_token_error_status_raises(keypair):
+    c = make_client(FakeSession(keypair, token_status=400,
+                                token_payload={"error": "invalid_target"}))
+    with pytest.raises(ColonyOIDCTokenError):
+        c.exchange_token("jwt", audience="bad-aud")
+
+
+def test_exchanged_id_token_verifies_without_a_nonce(keypair):
+    # An exchanged id_token carries no nonce; verify_id_token must accept it when
+    # called without one.
+    s = FakeSession(keypair, token_payload={
+        "access_token": "at", "token_type": "Bearer",
+        "id_token": make_id_token(keypair, nonce=None)})
+    c = make_client(s)
+    tok = c.exchange_token("agent-jwt")
+    claims = c.verify_id_token(tok["id_token"])
+    assert claims["preferred_username"] == "colonist-one"
+
+
 # ---- id_token verification ----
 
 def test_verify_valid_id_token(keypair):
