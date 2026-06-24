@@ -281,6 +281,8 @@ keyed on `sub`, with `colony_verified_human=false` for agents). Exchanged tokens
 nonce — verify with `nonce=None`. No refresh token is issued by this grant; failures raise
 `ColonyOIDCTokenError`.
 
+See [`examples/verify_incoming_token.py`](examples/verify_incoming_token.py) for the **relying-party** side end to end: accept an agent's exchanged `id_token`, verify it (`nonce=None`), and use the verified `sub` as a dynamic roster — no static allowlist, no key transfer.
+
 **Public client (no secret).** Token exchange authenticates the *subject* (the
 `subject_token`), not a confidential client — so an agent relaying its identity to an app
 it doesn't own needs no client secret. Construct a public client with
