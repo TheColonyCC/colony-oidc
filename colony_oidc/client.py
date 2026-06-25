@@ -403,6 +403,11 @@ class ColonyOIDCClient:
         self._dpop_key: Any = None
         self._dpop_alg = dpop_alg
         self._dpop_jwk: dict[str, Any] | None = None
+        # Most recent server-provided DPoP nonce (RFC 9449 §8/§9). The IdP
+        # hands one back in a ``DPoP-Nonce`` header (on a ``use_dpop_nonce``
+        # challenge or alongside a success); we cache it and embed it in the
+        # next proof. None until the server asks for one.
+        self._dpop_nonce: str | None = None
         if not self.dpop_enabled:
             return
         if dpop_alg not in DPOP_ALGS:
@@ -445,8 +450,32 @@ class ColonyOIDCClient:
         }
         if access_token is not None:
             claims["ath"] = _b64url(hashlib.sha256(access_token.encode()).digest())
+        # Echo the server's nonce (RFC 9449 §8) when we hold one.
+        if self._dpop_nonce is not None:
+            claims["nonce"] = self._dpop_nonce
         return jwt.encode(claims, self._dpop_key, algorithm=self._dpop_alg,
                           headers={"typ": "dpop+jwt", "jwk": self._dpop_jwk})
+
+    def _remember_dpop_nonce(self, response: Any) -> bool:
+        """Cache a ``DPoP-Nonce`` response header if present. Returns True
+        when a new nonce was captured (so a caller can decide to retry)."""
+        nonce = response.headers.get("DPoP-Nonce")
+        if nonce and nonce != self._dpop_nonce:
+            self._dpop_nonce = nonce
+            return True
+        return False
+
+    @staticmethod
+    def _is_use_dpop_nonce(response: Any) -> bool:
+        """Whether ``response`` is a server nonce challenge (RFC 9449 §8/§9):
+        a ``use_dpop_nonce`` error in the JSON body or the WWW-Authenticate
+        header."""
+        if "use_dpop_nonce" in response.headers.get("WWW-Authenticate", ""):
+            return True
+        try:
+            return response.json().get("error") == "use_dpop_nonce"
+        except ValueError:
+            return False
 
     def _token_request(self, data: dict[str, Any]) -> dict[str, Any]:
         """POST the token endpoint with the configured client auth, mapping any failure to
@@ -455,15 +484,28 @@ class ColonyOIDCClient:
         ``private_key_jwt``) and error handling. When DPoP is enabled a proof is
         attached so the issued tokens are sender-constrained to the proof key."""
         auth = self._client_auth(data)
-        headers = {"Accept": "application/json"}
         token_endpoint = self._endpoint("token_endpoint")
+
+        def _post() -> Any:
+            headers = {"Accept": "application/json"}
+            if self.dpop_enabled:
+                headers["DPoP"] = self._dpop_proof("POST", token_endpoint)
+            try:
+                return self._http.post(token_endpoint, data=data, auth=auth,
+                                       headers=headers, timeout=self.timeout)
+            except requests.RequestException as e:
+                raise ColonyOIDCTokenError(f"token request failed: {e}") from e
+
+        r = _post()
+        # The IdP may answer the first (nonce-less) proof with a
+        # ``use_dpop_nonce`` challenge (RFC 9449 §8); cache the supplied nonce
+        # and retry once with it embedded in a fresh proof.
+        if (self.dpop_enabled and r.status_code == 400
+                and self._is_use_dpop_nonce(r)):
+            self._remember_dpop_nonce(r)
+            r = _post()
         if self.dpop_enabled:
-            headers["DPoP"] = self._dpop_proof("POST", token_endpoint)
-        try:
-            r = self._http.post(token_endpoint, data=data, auth=auth,
-                                 headers=headers, timeout=self.timeout)
-        except requests.RequestException as e:
-            raise ColonyOIDCTokenError(f"token request failed: {e}") from e
+            self._remember_dpop_nonce(r)  # cache any rotated nonce
         if r.status_code != 200:
             raise ColonyOIDCTokenError(f"token endpoint returned {r.status_code}: {r.text[:300]}")
         try:
@@ -657,14 +699,32 @@ class ColonyOIDCClient:
         presented with the ``DPoP`` auth scheme (RFC 9449 §7.1) plus a proof
         carrying ``ath`` bound to this token; otherwise it is a plain Bearer."""
         userinfo_endpoint = self._endpoint("userinfo_endpoint")
-        if self.dpop_enabled:
-            headers = {"Authorization": f"DPoP {access_token}",
-                       "DPoP": self._dpop_proof("GET", userinfo_endpoint, access_token=access_token),
-                       "Accept": "application/json"}
-        else:
+        if not self.dpop_enabled:
             headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+            try:
+                r = self._http.get(userinfo_endpoint, headers=headers, timeout=self.timeout)
+                r.raise_for_status()
+                return r.json()
+            except requests.RequestException as e:
+                raise ColonyOIDCTokenError(f"userinfo request failed: {e}") from e
+        # DPoP: absorb a resource-server nonce challenge (RFC 9449 §9) — a
+        # first 401 ``use_dpop_nonce`` caches the nonce and retries once.
+        def _get() -> Any:
+            headers = {
+                "Authorization": f"DPoP {access_token}",
+                "DPoP": self._dpop_proof("GET", userinfo_endpoint, access_token=access_token),
+                "Accept": "application/json"}
+            try:
+                return self._http.get(userinfo_endpoint, headers=headers, timeout=self.timeout)
+            except requests.RequestException as e:
+                raise ColonyOIDCTokenError(f"userinfo request failed: {e}") from e
+
+        r = _get()
+        if r.status_code == 401 and self._is_use_dpop_nonce(r):
+            self._remember_dpop_nonce(r)
+            r = _get()
+        self._remember_dpop_nonce(r)
         try:
-            r = self._http.get(userinfo_endpoint, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             return r.json()
         except requests.RequestException as e:

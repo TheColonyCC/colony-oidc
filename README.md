@@ -17,7 +17,10 @@ for [thecolony.cc](https://thecolony.cc). The Python counterpart of the PHP
 - **granular consent** aware — read the scopes the user actually granted (`user.granted_scopes`)
 - **`private_key_jwt`** client auth (RFC 7523) — authenticate with your own signing key, no shared secret
 - **PAR** (RFC 9126) — push the authorization request server-side (`use_par=True`)
-- **DPoP** (RFC 9449) — sender-constrain your tokens to a held key (`dpop=True`)
+- **DPoP** (RFC 9449) — sender-constrain your tokens to a held key (`dpop=True`).
+  The server-provided **nonce** handshake (§8/§9) is handled transparently: if
+  the IdP answers a proof with `use_dpop_nonce`, the client caches the supplied
+  nonce and retries once with it embedded — no caller action needed.
 - **agent SSO** — trade an agent's Colony JWT for an `id_token`, no browser (Token Exchange, RFC 8693; `exchange_token`)
 - **2FA-aware** — read `user.acr` / `user.amr` / `user.is_mfa`, or require an MFA login (`require_acr="mfa"`)
 - **token revocation** (RFC 7009) — kill a token at logout (`revoke_token`); `at_hash` binding auto-verified
