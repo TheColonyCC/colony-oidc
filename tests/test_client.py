@@ -83,10 +83,11 @@ def make_logout_token(key, *, kid=KID, aud=CLIENT_ID, iss=ISSUER, sub="agent_123
 
 
 class FakeResp:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, headers=None):
         self._payload = payload
         self.status_code = status
         self.text = json.dumps(payload)
+        self.headers = headers or {}
     def json(self):
         return self._payload
     def raise_for_status(self):
@@ -1051,6 +1052,64 @@ def test_dpop_rsa_alg(keypair):
     hdr = jwt.get_unverified_header(s.token_headers["DPoP"])
     assert hdr["alg"] == "RS256" and hdr["jwk"]["kty"] == "RSA"
     _decode_dpop(s.token_headers["DPoP"], c, alg="RS256")           # verifies signature
+
+
+# ---- DPoP server-provided nonce handshake (RFC 9449 §8/§9) ----
+
+_SERVER_NONCE = "srv-nonce-xyz"
+
+
+class NonceSession(DpopSession):
+    """Challenges the FIRST DPoP request to each endpoint with
+    ``use_dpop_nonce`` + a ``DPoP-Nonce`` header, then serves normally —
+    capturing the proof from the SECOND (retried) attempt."""
+    def __init__(self, key, **kw):
+        super().__init__(key, **kw)
+        self.token_calls = 0
+        self.userinfo_calls = 0
+
+    def post(self, url, data=None, auth=None, **kw):
+        if url.endswith("/oauth/token"):
+            self.token_headers = kw.get("headers") or {}
+            self.token_calls += 1
+            if self.token_calls == 1:
+                return FakeResp({"error": "use_dpop_nonce"}, 400,
+                                headers={"DPoP-Nonce": _SERVER_NONCE})
+        return super().post(url, data=data, auth=auth, **kw)
+
+    def get(self, url, **kw):
+        if url.endswith("/userinfo"):
+            self.userinfo_headers = kw.get("headers") or {}
+            self.userinfo_calls += 1
+            if self.userinfo_calls == 1:
+                return FakeResp({"error": "use_dpop_nonce"}, 401,
+                                headers={"WWW-Authenticate": 'DPoP error="use_dpop_nonce"',
+                                         "DPoP-Nonce": _SERVER_NONCE})
+        return super().get(url, **kw)
+
+
+def test_dpop_token_nonce_handshake_retries_with_nonce(keypair):
+    s = NonceSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, "secret", discovery=DISCOVERY, session=s, dpop=True)
+    tok = c.fetch_token("authcode", "verifier123")
+    assert tok["access_token"] == "at_abc"        # the retry succeeded
+    assert s.token_calls == 2                       # challenge + retry
+    # The proof on the retry carries the server nonce.
+    claims = _decode_dpop(s.token_headers["DPoP"], c)
+    assert claims["nonce"] == _SERVER_NONCE
+    # And the client cached it for subsequent requests.
+    assert c._dpop_nonce == _SERVER_NONCE
+
+
+def test_dpop_userinfo_nonce_handshake_retries_with_nonce(keypair):
+    s = NonceSession(keypair)
+    c = ColonyOIDCClient(CLIENT_ID, "secret", discovery=DISCOVERY, session=s, dpop=True)
+    info = c.fetch_userinfo("at_abc")
+    assert info["sub"] == "agent_123"               # the retry succeeded
+    assert s.userinfo_calls == 2
+    claims = _decode_dpop(s.userinfo_headers["DPoP"], c)
+    assert claims["nonce"] == _SERVER_NONCE
+    assert claims["ath"] == _b64url(hashlib.sha256(b"at_abc").digest())
 
 
 def test_dpop_supplied_key_is_used(keypair):
