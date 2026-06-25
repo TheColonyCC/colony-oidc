@@ -650,6 +650,48 @@ def test_validate_logout_token_selects_by_kid(keypair):
     assert claims["sub"] == "agent_123"
 
 
+# ---- front-channel logout: validate_frontchannel_logout_request ----
+
+DISCOVERY_FCL = {**DISCOVERY, "frontchannel_logout_supported": True}
+
+
+def _fcl_client(keypair):
+    return ColonyOIDCClient(CLIENT_ID, "secret", REDIRECT, discovery=DISCOVERY_FCL,
+                            session=FakeSession(keypair))
+
+
+def test_frontchannel_logout_valid_returns_params(keypair):
+    c = _fcl_client(keypair)
+    out = c.validate_frontchannel_logout_request(
+        {"iss": ISSUER, "sid": "sess_42", "state": "xyz"}, expected_sid="sess_42")
+    assert out == {"iss": ISSUER, "sid": "sess_42", "state": "xyz"}
+
+
+def test_frontchannel_logout_iss_mismatch_raises(keypair):
+    c = _fcl_client(keypair)
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_frontchannel_logout_request({"iss": "https://evil.example", "sid": "sess_42"})
+
+
+def test_frontchannel_logout_sid_mismatch_raises(keypair):
+    c = _fcl_client(keypair)
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_frontchannel_logout_request(
+            {"iss": ISSUER, "sid": "sess_99"}, expected_sid="sess_42")
+
+
+def test_frontchannel_logout_not_advertised_raises(keypair):
+    c = make_client(FakeSession(keypair))            # default discovery: no FCL support
+    with pytest.raises(ColonyOIDCConfigError):
+        c.validate_frontchannel_logout_request({"iss": ISSUER, "sid": "sess_42"})
+
+
+def test_frontchannel_logout_missing_iss_raises(keypair):
+    c = _fcl_client(keypair)
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.validate_frontchannel_logout_request({"sid": "sess_42"})
+
+
 # ---- silent SSO (prompt=none) ----
 
 def test_create_silent_login_sets_prompt_none(keypair):
@@ -693,6 +735,40 @@ def test_raise_for_callback_error_generic(keypair):
 def test_raise_for_callback_error_noop_on_clean_code(keypair):
     c = make_client(FakeSession(keypair))
     assert c.raise_for_callback_error({"code": "abc", "state": "xyz"}) is None
+
+
+# ---- RFC 9207: authorization-response iss validation (mix-up defence) ----
+
+DISCOVERY_ISS = {**DISCOVERY, "authorization_response_iss_parameter_supported": True}
+
+
+def _iss_client(keypair):
+    return ColonyOIDCClient(CLIENT_ID, "secret", REDIRECT, discovery=DISCOVERY_ISS,
+                            session=FakeSession(keypair))
+
+
+def test_callback_iss_mismatch_raises_when_advertised(keypair):
+    c = _iss_client(keypair)
+    with pytest.raises(ColonyOIDCVerificationError):
+        c.raise_for_callback_error({"code": "abc", "iss": "https://evil.example"})
+
+
+def test_callback_iss_match_proceeds_when_advertised(keypair):
+    c = _iss_client(keypair)
+    # matching iss + a clean code → no raise, returns None
+    assert c.raise_for_callback_error({"code": "abc", "iss": ISSUER}) is None
+
+
+def test_callback_iss_absent_tolerated_when_advertised(keypair):
+    # provider advertises support but omits iss mid-rollout → backward-compatible no-raise
+    c = _iss_client(keypair)
+    assert c.raise_for_callback_error({"code": "abc"}) is None
+
+
+def test_callback_iss_mismatch_ignored_when_not_advertised(keypair):
+    # feature gated off: a mismatched iss is not even inspected
+    c = make_client(FakeSession(keypair))
+    assert c.raise_for_callback_error({"code": "abc", "iss": "https://evil.example"}) is None
 
 
 # ---- granular consent: granted_scopes ----
