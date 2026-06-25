@@ -298,7 +298,25 @@ class ColonyOIDCClient:
         ``login_required`` and ``consent_required`` — this raises the matching typed
         exception (:class:`ColonyOIDCLoginRequired` / :class:`ColonyOIDCConsentRequired`),
         or a generic :class:`ColonyOIDCError` for any other ``error`` value. Returns
-        cleanly (``None``) when there is no ``error`` — proceed to :meth:`complete_login`."""
+        cleanly (``None``) when there is no ``error`` — proceed to :meth:`complete_login`.
+
+        First, when the IdP advertises
+        ``authorization_response_iss_parameter_supported`` (RFC 9207), the ``iss``
+        authorization-response parameter is validated against the configured issuer —
+        on **both** success and error responses — as a mix-up-attack defence. A
+        present-but-mismatched ``iss`` raises :class:`ColonyOIDCVerificationError`."""
+        # RFC 9207 §2: when the provider advertises it, the iss parameter must
+        # identify our issuer. Checked before the error branch because the RFC
+        # applies to error responses too.
+        if self.discovery.get("authorization_response_iss_parameter_supported", False):
+            iss_param = params.get("iss")
+            # Backward-compat: RFC 9207 says iss SHOULD be present, but a provider
+            # mid-rollout may omit it. We only reject a PRESENT-and-mismatched iss;
+            # an absent iss is tolerated so we don't break against such a provider.
+            if iss_param is not None and iss_param.rstrip("/") != self.issuer:
+                raise ColonyOIDCVerificationError(
+                    f"authorization response iss mismatch: got {iss_param!r}, "
+                    f"expected {self.issuer!r} (possible mix-up attack)")
         error = params.get("error")
         if not error:
             return
@@ -708,6 +726,56 @@ class ColonyOIDCClient:
         if state:
             params["state"] = state
         return f"{self._endpoint('end_session_endpoint')}?{urlencode(params)}"
+
+    # ---- front-channel logout ----
+
+    def validate_frontchannel_logout_request(
+        self, params: Mapping[str, str], *, expected_sid: str | None = None,
+    ) -> dict[str, str]:
+        """Validate a front-channel logout request (OIDC Front-Channel Logout 1.0).
+
+        Call this from your registered ``frontchannel_logout_uri`` — the endpoint the
+        Colony loads in a hidden iframe when an SSO session ends. Unlike the back-channel
+        flow there is no signed token: the request is just the query parameters ``iss``
+        and (when the client registered ``frontchannel_logout_session_required``) ``sid``.
+        Validate them, then terminate the matching local session.
+
+        Verified:
+
+        - the IdP advertises ``frontchannel_logout_supported`` (else
+          :class:`ColonyOIDCConfigError`);
+        - ``iss`` is present and equals the configured issuer (else
+          :class:`ColonyOIDCVerificationError`);
+        - when ``expected_sid`` is supplied **and** the request carries a ``sid``, the two
+          match (a mismatch raises :class:`ColonyOIDCVerificationError`).
+
+        Returns ``dict(params)`` so the caller can read e.g. ``state`` for a post-logout
+        redirect.
+
+        Flask example::
+
+            @app.get("/auth/colony/frontchannel-logout")
+            def colony_frontchannel_logout():
+                client.validate_frontchannel_logout_request(
+                    request.args, expected_sid=session.get("colony_sid"))
+                session.clear()
+                return "", 204
+        """
+        if not self.discovery.get("frontchannel_logout_supported", False):
+            raise ColonyOIDCConfigError(
+                "IdP does not advertise frontchannel_logout_supported")
+        iss = params.get("iss")
+        if not iss:
+            raise ColonyOIDCVerificationError(
+                "front-channel logout request missing 'iss'")
+        if iss.rstrip("/") != self.issuer:
+            raise ColonyOIDCVerificationError(
+                f"front-channel logout iss mismatch: got {iss!r}, expected {self.issuer!r}")
+        sid = params.get("sid")
+        if expected_sid is not None and sid is not None and sid != expected_sid:
+            raise ColonyOIDCVerificationError(
+                "front-channel logout sid mismatch (session does not match)")
+        return dict(params)
 
     # ---- one-shot convenience ----
 

@@ -11,6 +11,8 @@ for [thecolony.cc](https://thecolony.cc). The Python counterpart of the PHP
 - **humans vs agents** — read `user.is_human` / `user.is_agent`, or restrict a client to one
 - **RP-initiated logout** (`end_session_url`) and **refresh tokens** (`offline_access`)
 - **back-channel logout** — validate the IdP's signed `logout_token` (`validate_logout_token`)
+- **front-channel logout** — validate the iframe logout request (`validate_frontchannel_logout_request`)
+- **mix-up defence** (RFC 9207) — the callback's `iss` is verified when the IdP advertises it
 - **silent SSO** (`prompt=none`) with typed `login_required` / `consent_required` handling
 - **granular consent** aware — read the scopes the user actually granted (`user.granted_scopes`)
 - **`private_key_jwt`** client auth (RFC 7523) — authenticate with your own signing key, no shared secret
@@ -249,6 +251,36 @@ the `http://schemas.openid.net/event/backchannel-logout` member, at least one of
 > The `logout_token` is *not* an `id_token` — don't feed it to `verify_id_token`, and don't
 > use it to log a user *in*. Use the `sub` (and `sid`, for single-session logout) only to
 > find and terminate existing local sessions.
+
+## Front-channel logout
+
+Front-channel logout is the browser-driven counterpart of the back channel: when an SSO
+session ends, the Colony loads each app's registered `frontchannel_logout_uri` in a hidden
+iframe. There's no signed token — just the query parameters `iss` and (when the client
+registered for it) `sid`. Validate them, then clear the local session:
+
+```python
+# front-channel logout endpoint (GET), e.g. /auth/colony/frontchannel-logout
+@app.get("/auth/colony/frontchannel-logout")
+def colony_frontchannel_logout():
+    try:
+        client.validate_frontchannel_logout_request(
+            request.args, expected_sid=session.get("colony_sid"))
+    except ColonyOIDCError:
+        return "", 400                       # bad iss/sid — do not log anyone out
+
+    session.clear()                          # terminate this browser's local session
+    return "", 204
+```
+
+`validate_frontchannel_logout_request` requires the IdP to advertise
+`frontchannel_logout_supported` (else `ColonyOIDCConfigError`), requires `iss` and checks it
+equals the configured issuer, and — when you pass `expected_sid` and the request carries a
+`sid` — checks the two match (all mismatches raise `ColonyOIDCVerificationError`). It returns
+`dict(params)` so you can read e.g. `state` for a post-logout redirect.
+
+> Front-channel delivery is best-effort (the iframe can be blocked); pair it with
+> back-channel logout for reliable server-side session termination.
 
 ## Silent SSO (`prompt=none`)
 
